@@ -6,7 +6,7 @@ use crate::{
     commitment::BlockCommitmentCache,
     contact_info::ContactInfo,
     gossip_service::{discover_cluster, GossipService},
-    poh_recorder::PohRecorder,
+    poh_recorder::{PohRecorder, GRACE_TICKS_FACTOR, MAX_GRACE_SLOTS},
     poh_service::PohService,
     rewards_recorder_service::RewardsRecorderService,
     rpc::JsonRpcConfig,
@@ -30,19 +30,21 @@ use solana_ledger::{
     create_new_tmp_ledger,
     leader_schedule::FixedSchedule,
     leader_schedule_cache::LeaderScheduleCache,
-    shred_version::compute_shred_version,
 };
 use solana_metrics::datapoint_info;
 use solana_runtime::bank::Bank;
 use solana_sdk::{
     clock::{Slot, DEFAULT_SLOTS_PER_TURN},
+    epoch_schedule::MAX_LEADER_SCHEDULE_EPOCH_OFFSET,
     genesis_config::GenesisConfig,
     hash::Hash,
     pubkey::Pubkey,
+    shred_version::compute_shred_version,
     signature::{Keypair, Signer},
     timing::timestamp,
 };
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
@@ -72,6 +74,7 @@ pub struct ValidatorConfig {
     pub fixed_leader_schedule: Option<FixedSchedule>,
     pub wait_for_supermajority: bool,
     pub new_hard_forks: Option<Vec<Slot>>,
+    pub trusted_validators: Option<HashSet<Pubkey>>, // None = trust all
 }
 
 impl Default for ValidatorConfig {
@@ -94,6 +97,7 @@ impl Default for ValidatorConfig {
             fixed_leader_schedule: None,
             wait_for_supermajority: false,
             new_hard_forks: None,
+            trusted_validators: None,
         }
     }
 }
@@ -166,12 +170,7 @@ impl Validator {
             completed_slots_receiver,
             leader_schedule_cache,
             snapshot_hash,
-        ) = new_banks_from_blockstore(
-            config.expected_genesis_hash,
-            ledger_path,
-            poh_verify,
-            config,
-        );
+        ) = new_banks_from_blockstore(config, ledger_path, poh_verify);
 
         let leader_schedule_cache = Arc::new(leader_schedule_cache);
         let exit = Arc::new(AtomicBool::new(false));
@@ -305,7 +304,13 @@ impl Validator {
             bank.tick_height(),
             bank.last_blockhash(),
             bank.slot(),
-            leader_schedule_cache.next_leader_slot(&id, bank.slot(), &bank, Some(&blockstore)),
+            leader_schedule_cache.next_leader_slot(
+                &id,
+                bank.slot(),
+                &bank,
+                Some(&blockstore),
+                GRACE_TICKS_FACTOR * MAX_GRACE_SLOTS,
+            ),
             bank.ticks_per_slot(),
             &id,
             &blockstore,
@@ -345,9 +350,7 @@ impl Validator {
         }
 
         if let Some(snapshot_hash) = snapshot_hash {
-            if let Some(ref trusted_validators) =
-                config.snapshot_config.as_ref().unwrap().trusted_validators
-            {
+            if let Some(ref trusted_validators) = config.trusted_validators {
                 let mut trusted = false;
                 for _ in 0..10 {
                     trusted = cluster_info
@@ -544,10 +547,9 @@ impl Validator {
 
 #[allow(clippy::type_complexity)]
 fn new_banks_from_blockstore(
-    expected_genesis_hash: Option<Hash>,
+    config: &ValidatorConfig,
     blockstore_path: &Path,
     poh_verify: bool,
-    config: &ValidatorConfig,
 ) -> (
     GenesisConfig,
     BankForks,
@@ -562,10 +564,18 @@ fn new_banks_from_blockstore(
         error!("Failed to load genesis from {:?}: {}", blockstore_path, err);
         process::exit(1);
     });
+
+    // This needs to be limited otherwise the state in the VoteAccount data
+    // grows too large
+    let leader_schedule_slot_offset = genesis_config.epoch_schedule.leader_schedule_slot_offset;
+    let slots_per_epoch = genesis_config.epoch_schedule.slots_per_epoch;
+    let leader_epoch_offset = (leader_schedule_slot_offset + slots_per_epoch - 1) / slots_per_epoch;
+    assert!(leader_epoch_offset <= MAX_LEADER_SCHEDULE_EPOCH_OFFSET);
+
     let genesis_hash = genesis_config.hash();
     info!("genesis hash: {}", genesis_hash);
 
-    if let Some(expected_genesis_hash) = expected_genesis_hash {
+    if let Some(expected_genesis_hash) = config.expected_genesis_hash {
         if genesis_hash != expected_genesis_hash {
             error!("genesis hash mismatch: expected {}", expected_genesis_hash);
             error!(
@@ -639,74 +649,94 @@ fn wait_for_supermajority(
     }
 }
 
-pub fn new_validator_for_tests() -> (Validator, ContactInfo, Keypair, PathBuf) {
-    let (node, contact_info, mint_keypair, ledger_path, _vote_pubkey) =
-        new_validator_for_tests_with_vote_pubkey();
-    (node, contact_info, mint_keypair, ledger_path)
+pub struct TestValidator {
+    pub server: Validator,
+    pub leader_data: ContactInfo,
+    pub alice: Keypair,
+    pub ledger_path: PathBuf,
+    pub genesis_hash: Hash,
+    pub vote_pubkey: Pubkey,
 }
 
-pub fn new_validator_for_tests_with_vote_pubkey(
-) -> (Validator, ContactInfo, Keypair, PathBuf, Pubkey) {
-    use crate::genesis_utils::BOOTSTRAP_VALIDATOR_LAMPORTS;
-    new_validator_for_tests_ex(0, BOOTSTRAP_VALIDATOR_LAMPORTS)
+pub struct TestValidatorOptions {
+    pub fees: u64,
+    pub bootstrap_validator_lamports: u64,
 }
 
-pub fn new_validator_for_tests_ex(
-    fees: u64,
-    bootstrap_validator_lamports: u64,
-) -> (Validator, ContactInfo, Keypair, PathBuf, Pubkey) {
-    use crate::genesis_utils::{create_genesis_config_with_leader_ex, GenesisConfigInfo};
-    use solana_sdk::fee_calculator::FeeCalculator;
+impl Default for TestValidatorOptions {
+    fn default() -> Self {
+        use crate::genesis_utils::BOOTSTRAP_VALIDATOR_LAMPORTS;
+        TestValidatorOptions {
+            fees: 0,
+            bootstrap_validator_lamports: BOOTSTRAP_VALIDATOR_LAMPORTS,
+        }
+    }
+}
 
-    let node_keypair = Arc::new(Keypair::new());
-    let node = Node::new_localhost_with_pubkey(&node_keypair.pubkey());
-    let contact_info = node.info.clone();
+impl TestValidator {
+    pub fn run() -> Self {
+        Self::run_with_options(TestValidatorOptions::default())
+    }
 
-    let GenesisConfigInfo {
-        mut genesis_config,
-        mint_keypair,
-        voting_keypair,
-    } = create_genesis_config_with_leader_ex(
-        1_000_000,
-        &contact_info.id,
-        42,
-        bootstrap_validator_lamports,
-    );
-    genesis_config
-        .native_instruction_processors
-        .push(solana_budget_program!());
+    pub fn run_with_options(options: TestValidatorOptions) -> Self {
+        use crate::genesis_utils::{create_genesis_config_with_leader_ex, GenesisConfigInfo};
+        use solana_sdk::fee_calculator::FeeCalculator;
 
-    genesis_config.rent.lamports_per_byte_year = 1;
-    genesis_config.rent.exemption_threshold = 1.0;
-    genesis_config.fee_calculator = FeeCalculator::new(fees, 0);
+        let TestValidatorOptions {
+            fees,
+            bootstrap_validator_lamports,
+        } = options;
+        let node_keypair = Arc::new(Keypair::new());
+        let node = Node::new_localhost_with_pubkey(&node_keypair.pubkey());
+        let contact_info = node.info.clone();
 
-    let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            voting_keypair,
+        } = create_genesis_config_with_leader_ex(
+            1_000_000,
+            &contact_info.id,
+            42,
+            bootstrap_validator_lamports,
+        );
+        genesis_config
+            .native_instruction_processors
+            .push(solana_budget_program!());
 
-    let leader_voting_keypair = Arc::new(voting_keypair);
-    let storage_keypair = Arc::new(Keypair::new());
-    let config = ValidatorConfig {
-        rpc_ports: Some((node.info.rpc.port(), node.info.rpc_pubsub.port())),
-        ..ValidatorConfig::default()
-    };
-    let node = Validator::new(
-        node,
-        &node_keypair,
-        &ledger_path,
-        &leader_voting_keypair.pubkey(),
-        &leader_voting_keypair,
-        &storage_keypair,
-        None,
-        true,
-        &config,
-    );
-    discover_cluster(&contact_info.gossip, 1).expect("Node startup failed");
-    (
-        node,
-        contact_info,
-        mint_keypair,
-        ledger_path,
-        leader_voting_keypair.pubkey(),
-    )
+        genesis_config.rent.lamports_per_byte_year = 1;
+        genesis_config.rent.exemption_threshold = 1.0;
+        genesis_config.fee_calculator = FeeCalculator::new(fees, 0);
+
+        let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
+
+        let leader_voting_keypair = Arc::new(voting_keypair);
+        let storage_keypair = Arc::new(Keypair::new());
+        let config = ValidatorConfig {
+            rpc_ports: Some((node.info.rpc.port(), node.info.rpc_pubsub.port())),
+            ..ValidatorConfig::default()
+        };
+        let node = Validator::new(
+            node,
+            &node_keypair,
+            &ledger_path,
+            &leader_voting_keypair.pubkey(),
+            &leader_voting_keypair,
+            &storage_keypair,
+            None,
+            true,
+            &config,
+        );
+        discover_cluster(&contact_info.gossip, 1).expect("Node startup failed");
+        TestValidator {
+            server: node,
+            leader_data: contact_info,
+            alice: mint_keypair,
+            ledger_path,
+            genesis_hash: blockhash,
+            vote_pubkey: leader_voting_keypair.pubkey(),
+        }
+    }
 }
 
 fn report_target_features() {

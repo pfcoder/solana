@@ -11,12 +11,11 @@ use solana_ledger::{
     blockstore_db::{self, Column, Database},
     blockstore_processor::{BankForksInfo, ProcessOptions},
     rooted_slot_iterator::RootedSlotIterator,
-    shred_version::compute_shred_version,
     snapshot_utils,
 };
 use solana_sdk::{
     clock::Slot, genesis_config::GenesisConfig, native_token::lamports_to_sol,
-    program_utils::limited_deserialize, pubkey::Pubkey,
+    program_utils::limited_deserialize, pubkey::Pubkey, shred_version::compute_shred_version,
 };
 use solana_vote_program::vote_state::VoteState;
 use std::{
@@ -537,7 +536,6 @@ fn load_bank_forks(
             snapshot_interval_slots: 0, // Value doesn't matter
             snapshot_package_output_path: ledger_path.clone(),
             snapshot_path: ledger_path.clone().join("snapshot"),
-            trusted_validators: None,
         })
     };
     let account_paths = if let Some(account_paths) = arg_matches.value_of("account_paths") {
@@ -605,7 +603,7 @@ fn main() {
             .arg(&starting_slot_arg)
         )
         .subcommand(
-            SubCommand::with_name("print-slot")
+            SubCommand::with_name("slot")
             .about("Print the contents of one or more slots")
             .arg(
                 Arg::with_name("slots")
@@ -616,6 +614,10 @@ fn main() {
                     .required(true)
                     .help("List of slots to print"),
             )
+        )
+        .subcommand(
+            SubCommand::with_name("genesis")
+            .about("Prints the ledger's genesis config")
         )
         .subcommand(
             SubCommand::with_name("genesis-hash")
@@ -694,7 +696,7 @@ fn main() {
                     .help("Output directory for the snapshot"),
             )
         ).subcommand(
-            SubCommand::with_name("print-accounts")
+            SubCommand::with_name("accounts")
             .about("Print account contents after processing in the ledger")
             .arg(&no_snapshot_arg)
             .arg(&account_paths_arg)
@@ -764,6 +766,9 @@ fn main() {
                 LedgerOutputMethod::Print,
             );
         }
+        ("genesis", Some(_arg_matches)) => {
+            println!("{}", open_genesis_config(&ledger_path));
+        }
         ("genesis-hash", Some(_arg_matches)) => {
             println!("{}", open_genesis_config(&ledger_path).hash());
         }
@@ -794,7 +799,7 @@ fn main() {
                 }
             }
         }
-        ("print-slot", Some(arg_matches)) => {
+        ("slot", Some(arg_matches)) => {
             let slots = values_t_or_exit!(arg_matches, "slots", Slot);
             for slot in slots {
                 println!("Slot {}", slot);
@@ -943,7 +948,7 @@ fn main() {
                 }
             }
         }
-        ("print-accounts", Some(arg_matches)) => {
+        ("accounts", Some(arg_matches)) => {
             let dev_halt_at_slot = value_t!(arg_matches, "halt_at_slot", Slot).ok();
             let process_options = ProcessOptions {
                 dev_halt_at_slot,

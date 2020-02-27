@@ -27,6 +27,7 @@ use solana_ledger::bank_forks::SnapshotConfig;
 use solana_perf::recycler::enable_recycler_warming;
 use solana_sdk::{
     clock::Slot,
+    genesis_config::GenesisConfig,
     hash::Hash,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
@@ -35,7 +36,7 @@ use std::{
     collections::HashSet,
     fs::{self, File},
     io::{self, Read},
-    net::{SocketAddr, TcpListener},
+    net::{SocketAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::exit,
     str::FromStr,
@@ -79,39 +80,25 @@ fn new_spinner_progress_bar() -> ProgressBar {
     progress_bar
 }
 
-fn download_tar_bz2(
-    rpc_addr: &SocketAddr,
-    archive_name: &str,
-    download_path: &Path,
-    is_snapshot: bool,
-) -> Result<(), String> {
-    let archive_path = download_path.join(archive_name);
-    if archive_path.is_file() {
-        return Ok(());
+fn download_file(url: &str, destination_file: &Path, not_found_ok: bool) -> Result<(), String> {
+    if destination_file.is_file() {
+        return Err(format!("{:?} already exists", destination_file));
     }
-    fs::create_dir_all(download_path).map_err(|err| err.to_string())?;
-
-    let temp_archive_path = {
-        let mut p = archive_path.clone();
-        p.set_extension(".tmp");
-        p
-    };
-
-    let url = format!("http://{}/{}", rpc_addr, archive_name);
     let download_start = Instant::now();
+
+    fs::create_dir_all(destination_file.parent().unwrap()).map_err(|err| err.to_string())?;
+
+    let temp_destination_file = destination_file.with_extension(".tmp");
 
     let progress_bar = new_spinner_progress_bar();
     progress_bar.set_message(&format!("{}Downloading {}...", TRUCK, url));
 
     let client = reqwest::blocking::Client::new();
-    let response = client
-        .get(url.as_str())
-        .send()
-        .map_err(|err| err.to_string())?;
+    let response = client.get(url).send().map_err(|err| err.to_string())?;
 
-    if is_snapshot && response.status() == reqwest::StatusCode::NOT_FOUND {
+    if response.status() == reqwest::StatusCode::NOT_FOUND && not_found_ok {
         progress_bar.finish_and_clear();
-        warn!("Snapshot not found at {}", url);
+        info!("Archive not found at {}", url);
         return Ok(());
     }
 
@@ -158,10 +145,10 @@ fn download_tar_bz2(
         response,
     };
 
-    let mut file = File::create(&temp_archive_path)
-        .map_err(|err| format!("Unable to create {:?}: {:?}", temp_archive_path, err))?;
+    let mut file = File::create(&temp_destination_file)
+        .map_err(|err| format!("Unable to create {:?}: {:?}", temp_destination_file, err))?;
     std::io::copy(&mut source, &mut file)
-        .map_err(|err| format!("Unable to write {:?}: {:?}", temp_archive_path, err))?;
+        .map_err(|err| format!("Unable to write {:?}: {:?}", temp_destination_file, err))?;
 
     source.progress_bar.finish_and_clear();
     info!(
@@ -175,36 +162,88 @@ fn download_tar_bz2(
         )
     );
 
-    if !is_snapshot {
-        info!("Extracting {:?}...", archive_path);
-        let extract_start = Instant::now();
-        let tar_bz2 = File::open(&temp_archive_path)
-            .map_err(|err| format!("Unable to open {}: {:?}", archive_name, err))?;
-        let tar = BzDecoder::new(std::io::BufReader::new(tar_bz2));
-        let mut archive = tar::Archive::new(tar);
-        archive
-            .unpack(download_path)
-            .map_err(|err| format!("Unable to unpack {}: {:?}", archive_name, err))?;
-        info!(
-            "Extracted {} in {:?}",
-            archive_name,
-            Instant::now().duration_since(extract_start)
-        );
-    }
-    std::fs::rename(temp_archive_path, archive_path)
+    std::fs::rename(temp_destination_file, destination_file)
         .map_err(|err| format!("Unable to rename: {:?}", err))?;
 
     Ok(())
 }
 
-fn get_rpc_addr(
-    node: &Node,
+fn extract_archive(archive_filename: &Path, destination_dir: &Path) -> Result<(), String> {
+    info!("Extracting {:?}...", archive_filename);
+    let extract_start = Instant::now();
+
+    fs::create_dir_all(destination_dir).map_err(|err| err.to_string())?;
+    let tar_bz2 = File::open(&archive_filename)
+        .map_err(|err| format!("Unable to open {:?}: {:?}", archive_filename, err))?;
+    let tar = BzDecoder::new(std::io::BufReader::new(tar_bz2));
+    let mut archive = tar::Archive::new(tar);
+    archive
+        .unpack(destination_dir)
+        .map_err(|err| format!("Unable to unpack {:?}: {:?}", archive_filename, err))?;
+    info!(
+        "Extracted {:?} in {:?}",
+        archive_filename,
+        Instant::now().duration_since(extract_start)
+    );
+    Ok(())
+}
+
+fn get_shred_rpc_peers(
+    cluster_info: &Arc<RwLock<ClusterInfo>>,
+    expected_shred_version: Option<u16>,
+) -> Vec<ContactInfo> {
+    let rpc_peers = cluster_info.read().unwrap().all_rpc_peers();
+    match expected_shred_version {
+        Some(expected_shred_version) => {
+            // Filter out rpc peers that don't match the expected shred version
+            rpc_peers
+                .into_iter()
+                .filter(|contact_info| contact_info.shred_version == expected_shred_version)
+                .collect::<Vec<_>>()
+        }
+        None => {
+            if !rpc_peers
+                .iter()
+                .all(|contact_info| contact_info.shred_version == rpc_peers[0].shred_version)
+            {
+                eprintln!(
+                        "Multiple shred versions observed in gossip.  Restart with --expected-shred-version"
+                    );
+                exit(1);
+            }
+            rpc_peers
+        }
+    }
+}
+
+fn get_trusted_snapshot_hashes(
+    cluster_info: &Arc<RwLock<ClusterInfo>>,
+    trusted_validators: &Option<HashSet<Pubkey>>,
+) -> Option<HashSet<(Slot, Hash)>> {
+    if let Some(trusted_validators) = trusted_validators {
+        let mut trusted_snapshot_hashes = HashSet::new();
+        for trusted_validator in trusted_validators {
+            if let Some(snapshot_hashes) = cluster_info
+                .read()
+                .unwrap()
+                .get_snapshot_hash_for_node(trusted_validator)
+            {
+                for snapshot_hash in snapshot_hashes {
+                    trusted_snapshot_hashes.insert(*snapshot_hash);
+                }
+            }
+        }
+        Some(trusted_snapshot_hashes)
+    } else {
+        None
+    }
+}
+
+fn start_gossip_spy(
     identity_keypair: &Arc<Keypair>,
     entrypoint_gossip: &SocketAddr,
-    expected_shred_version: Option<u16>,
-    trusted_validators: Option<&HashSet<Pubkey>>,
-    snapshot_not_required: bool,
-) -> (RpcClient, SocketAddr) {
+    gossip_socket: UdpSocket,
+) -> (Arc<RwLock<ClusterInfo>>, Arc<AtomicBool>, GossipService) {
     let mut cluster_info = ClusterInfo::new(
         ClusterInfo::spy_contact_info(&identity_keypair.pubkey()),
         identity_keypair.clone(),
@@ -216,140 +255,122 @@ fn get_rpc_addr(
     let gossip_service = GossipService::new(
         &cluster_info.clone(),
         None,
-        node.sockets.gossip.try_clone().unwrap(),
+        gossip_socket,
         &gossip_exit_flag,
     );
+    (cluster_info, gossip_exit_flag, gossip_service)
+}
 
-    let (rpc_client, rpc_addr) = loop {
+fn get_rpc_node(
+    cluster_info: &Arc<RwLock<ClusterInfo>>,
+    validator_config: &ValidatorConfig,
+    blacklisted_rpc_nodes: &mut HashSet<Pubkey>,
+    snapshot_not_required: bool,
+) -> (ContactInfo, Option<(Slot, Hash)>) {
+    let mut blacklist_timeout = Instant::now();
+    loop {
         info!(
-            "Searching for an RPC service, shred version={:?}...\n{}",
-            expected_shred_version,
-            cluster_info.read().unwrap().contact_info_trace()
+            "Searching for an RPC service, shred version={:?}...",
+            validator_config.expected_shred_version
+        );
+        sleep(Duration::from_secs(1));
+        info!("\n{}", cluster_info.read().unwrap().contact_info_trace());
+
+        let rpc_peers = get_shred_rpc_peers(&cluster_info, validator_config.expected_shred_version);
+        let rpc_peers_total = rpc_peers.len();
+
+        // Filter out blacklisted nodes
+        let rpc_peers: Vec<_> = rpc_peers
+            .into_iter()
+            .filter(|rpc_peer| !blacklisted_rpc_nodes.contains(&rpc_peer.id))
+            .collect();
+        let rpc_peers_blacklisted = rpc_peers_total - rpc_peers.len();
+
+        info!(
+            "Total {} RPC nodes found. {} blacklisted ",
+            rpc_peers_total, rpc_peers_blacklisted
         );
 
-        let mut rpc_peers = cluster_info.read().unwrap().all_rpc_peers();
-        match expected_shred_version {
-            Some(expected_shred_version) => {
-                // Filter out rpc peers that don't match the expected shred version
-                rpc_peers = rpc_peers
-                    .into_iter()
-                    .filter(|contact_info| contact_info.shred_version == expected_shred_version)
-                    .collect::<Vec<_>>();
+        if rpc_peers_blacklisted == rpc_peers_total {
+            // If all nodes are blacklisted and no additional nodes are discovered after 60 seconds,
+            // remove the blacklist and try them all again
+            if blacklist_timeout.elapsed().as_secs() > 60 {
+                info!("Blacklist timeout expired");
+                blacklisted_rpc_nodes.clear();
             }
-            None => {
-                if !rpc_peers
-                    .iter()
-                    .all(|contact_info| contact_info.shred_version == rpc_peers[0].shred_version)
-                {
-                    eprintln!(
-                        "Multiple shred versions observed in gossip.  Restart with --expected-shred-version"
-                    );
-                    exit(1);
-                }
-            }
+            continue;
         }
+        blacklist_timeout = Instant::now();
 
-        let trusted_slots = if let Some(trusted_validators) = trusted_validators {
-            let trusted_slots = HashSet::new();
-            for trusted_validator in trusted_validators {
-                if let Some(slot_hash) = cluster_info
+        let mut highest_snapshot_hash: Option<(Slot, Hash)> = None;
+        let eligible_rpc_peers = if snapshot_not_required {
+            rpc_peers
+        } else {
+            let trusted_snapshot_hashes =
+                get_trusted_snapshot_hashes(&cluster_info, &validator_config.trusted_validators);
+
+            let mut eligible_rpc_peers = vec![];
+
+            for rpc_peer in rpc_peers.iter() {
+                if let Some(snapshot_hashes) = cluster_info
                     .read()
                     .unwrap()
-                    .get_snapshot_hash_for_node(trusted_validator)
+                    .get_snapshot_hash_for_node(&rpc_peer.id)
                 {
-                    trusted_slots.union(&slot_hash.iter().collect());
-                }
-            }
-            Some(trusted_slots)
-        } else {
-            None
-        };
-
-        if rpc_peers.is_empty() {
-            info!("No RPC services found ");
-        } else {
-            let eligible_rpc_peers = if snapshot_not_required {
-                rpc_peers
-            } else {
-                let mut eligible_rpc_peers = vec![];
-                let mut highest_snapshot_slot = 0;
-
-                for rpc_peer in rpc_peers.iter() {
-                    if let Some(snapshot_hash) = cluster_info
-                        .read()
-                        .unwrap()
-                        .get_snapshot_hash_for_node(&rpc_peer.id)
-                    {
-                        let highest_snapshot_slot_for_node =
-                            snapshot_hash.iter().fold(0, |highest_slot, snapshot_hash| {
-                                if let Some(ref trusted_slots) = trusted_slots {
-                                    if !trusted_slots.contains(snapshot_hash) {
-                                        // Ignore all untrusted slots
-                                        return highest_slot;
-                                    }
-                                }
-                                highest_slot.max(snapshot_hash.0)
-                            });
-
-                        if highest_snapshot_slot_for_node > highest_snapshot_slot {
-                            // Found a higher snapshot, remove all rpc peers with a lower snapshot
-                            eligible_rpc_peers.clear();
-                            highest_snapshot_slot = highest_snapshot_slot_for_node;
+                    for snapshot_hash in snapshot_hashes {
+                        if let Some(ref trusted_snapshot_hashes) = trusted_snapshot_hashes {
+                            if !trusted_snapshot_hashes.contains(snapshot_hash) {
+                                // Ignore all untrusted snapshot hashes
+                                continue;
+                            }
                         }
 
-                        if highest_snapshot_slot_for_node == highest_snapshot_slot {
+                        if highest_snapshot_hash.is_none()
+                            || snapshot_hash.0 > highest_snapshot_hash.unwrap().0
+                        {
+                            // Found a higher snapshot, remove all nodes with a lower snapshot
+                            eligible_rpc_peers.clear();
+                            highest_snapshot_hash = Some(*snapshot_hash)
+                        }
+
+                        if Some(*snapshot_hash) == highest_snapshot_hash {
                             eligible_rpc_peers.push(rpc_peer.clone());
                         }
                     }
                 }
+            }
 
-                if highest_snapshot_slot == 0 {
+            match highest_snapshot_hash {
+                None => {
                     assert!(eligible_rpc_peers.is_empty());
-                    info!("No snapshot available");
-                } else {
+                    info!("No snapshots available");
+                }
+                Some(highest_snapshot_hash) => {
                     info!(
-                        "Highest available snapshot slot is {}",
-                        highest_snapshot_slot
+                        "Highest available snapshot slot is {}, available from {} node{}: {:?}",
+                        highest_snapshot_hash.0,
+                        eligible_rpc_peers.len(),
+                        if eligible_rpc_peers.len() > 1 {
+                            "s"
+                        } else {
+                            ""
+                        },
+                        eligible_rpc_peers
+                            .iter()
+                            .map(|contact_info| contact_info.id)
+                            .collect::<Vec<_>>()
                     );
                 }
-                eligible_rpc_peers
-            };
-
-            if !eligible_rpc_peers.is_empty() {
-                // Prefer the entrypoint's RPC service if present, otherwise pick one at random
-                let contact_info = if let Some(contact_info) = eligible_rpc_peers
-                    .iter()
-                    .find(|contact_info| contact_info.gossip == *entrypoint_gossip)
-                {
-                    contact_info
-                } else {
-                    &eligible_rpc_peers[thread_rng().gen_range(0, eligible_rpc_peers.len())]
-                };
-
-                info!(
-                    "Trying RPC service from node {}: {:?}",
-                    contact_info.id, contact_info.rpc
-                );
-                let rpc_client = RpcClient::new_socket(contact_info.rpc);
-                match rpc_client.get_version() {
-                    Ok(rpc_version) => {
-                        info!("RPC node version: {}", rpc_version.solana_core);
-                        break (rpc_client, contact_info.rpc);
-                    }
-                    Err(err) => {
-                        warn!("Failed to get RPC node's version: {}", err);
-                    }
-                }
             }
+            eligible_rpc_peers
+        };
+
+        if !eligible_rpc_peers.is_empty() {
+            let contact_info =
+                &eligible_rpc_peers[thread_rng().gen_range(0, eligible_rpc_peers.len())];
+            return (contact_info.clone(), highest_snapshot_hash);
         }
-
-        sleep(Duration::from_secs(1));
-    };
-
-    gossip_exit_flag.store(true, Ordering::Relaxed);
-    gossip_service.join().unwrap();
-
-    (rpc_client, rpc_addr)
+    }
 }
 
 fn check_vote_account(
@@ -375,10 +396,32 @@ fn check_vote_account(
 
     let found_vote_account = solana_vote_program::vote_state::VoteState::from(&found_vote_account);
     if let Some(found_vote_account) = found_vote_account {
-        if found_vote_account.authorized_voter != *voting_pubkey {
+        if found_vote_account.authorized_voters().is_empty() {
+            return Err("Vote account not yet initialized".to_string());
+        }
+
+        let epoch_info = rpc_client
+            .get_epoch_info()
+            .map_err(|err| format!("Failed to get epoch info: {}", err.to_string()))?;
+
+        let mut authorized_voter;
+        authorized_voter = found_vote_account.get_authorized_voter(epoch_info.epoch);
+        if authorized_voter.is_none() {
+            // Must have gotten a clock on the boundary
+            authorized_voter = found_vote_account.get_authorized_voter(epoch_info.epoch + 1);
+        }
+
+        let authorized_voter = authorized_voter.expect(
+            "Could not get the authorized voter, which only happens if the
+            client gets an epoch earlier than the current epoch,
+            but the received epoch should not be off by more than
+            one epoch",
+        );
+
+        if authorized_voter != *voting_pubkey {
             return Err(format!(
                 "account's authorized voter ({}) does not match to the given voting keypair ({}).",
-                found_vote_account.authorized_voter, voting_pubkey
+                authorized_voter, voting_pubkey
             ));
         }
         if found_vote_account.node_pubkey != *node_pubkey {
@@ -402,28 +445,77 @@ fn check_vote_account(
     Ok(())
 }
 
-fn download_ledger(
+fn download_genesis(
     rpc_addr: &SocketAddr,
     ledger_path: &Path,
-    no_snapshot_fetch: bool,
+    validator_config: &mut ValidatorConfig,
 ) -> Result<(), String> {
-    download_tar_bz2(rpc_addr, "genesis.tar.bz2", ledger_path, false)?;
+    let genesis_package = ledger_path.join("genesis.tar.bz2");
 
-    if !no_snapshot_fetch {
-        let snapshot_package =
-            solana_ledger::snapshot_utils::get_snapshot_archive_path(ledger_path);
-        if snapshot_package.exists() {
-            fs::remove_file(&snapshot_package)
-                .map_err(|err| format!("error removing {:?}: {}", snapshot_package, err))?;
+    let genesis_config = if !genesis_package.exists() {
+        let tmp_genesis_path = ledger_path.join("tmp-genesis");
+        let tmp_genesis_package = tmp_genesis_path.join("genesis.tar.bz2");
+
+        let _ignored = fs::remove_dir_all(&tmp_genesis_path);
+        download_file(
+            &format!("http://{}/{}", rpc_addr, "genesis.tar.bz2"),
+            &tmp_genesis_package,
+            false,
+        )?;
+        extract_archive(&tmp_genesis_package, &ledger_path)?;
+
+        let tmp_genesis_config = GenesisConfig::load(&ledger_path)
+            .map_err(|err| format!("Failed to load downloaded genesis config: {}", err))?;
+
+        if let Some(expected_genesis_hash) = validator_config.expected_genesis_hash {
+            if expected_genesis_hash != tmp_genesis_config.hash() {
+                return Err(format!(
+                    "Genesis hash mismatch: expected {} but downloaded genesis hash is {}",
+                    expected_genesis_hash,
+                    tmp_genesis_config.hash(),
+                ));
+            }
         }
-        download_tar_bz2(
-            rpc_addr,
-            snapshot_package.file_name().unwrap().to_str().unwrap(),
-            snapshot_package.parent().unwrap(),
-            true,
-        )
-        .map_err(|err| format!("Failed to fetch snapshot: {:?}", err))?;
+
+        std::fs::rename(tmp_genesis_package, genesis_package)
+            .map_err(|err| format!("Unable to rename: {:?}", err))?;
+        tmp_genesis_config
+    } else {
+        GenesisConfig::load(&ledger_path)
+            .map_err(|err| format!("Failed to load genesis config: {}", err))?
+    };
+
+    if validator_config.expected_genesis_hash.is_none() {
+        info!("Expected genesis hash set to {}", genesis_config.hash());
+        // If no particular genesis hash is expected use the one that's here
+        validator_config.expected_genesis_hash = Some(genesis_config.hash());
     }
+    Ok(())
+}
+
+fn download_snapshot(
+    rpc_addr: &SocketAddr,
+    ledger_path: &Path,
+    snapshot_hash: Option<(Slot, Hash)>,
+) -> Result<(), String> {
+    if snapshot_hash.is_none() {
+        return Ok(());
+    }
+
+    let snapshot_package = solana_ledger::snapshot_utils::get_snapshot_archive_path(ledger_path);
+    if snapshot_package.exists() {
+        fs::remove_file(&snapshot_package)
+            .map_err(|err| format!("error removing {:?}: {}", snapshot_package, err))?;
+    }
+    download_file(
+        &format!(
+            "http://{}/{}",
+            rpc_addr,
+            snapshot_package.file_name().unwrap().to_str().unwrap()
+        ),
+        &snapshot_package,
+        true,
+    )?;
 
     Ok(())
 }
@@ -544,6 +636,14 @@ pub fn main() {
                 .long("no-voting")
                 .takes_value(false)
                 .help("Launch node without voting"),
+        )
+        .arg(
+            Arg::with_name("no_check_vote_account")
+                .long("no-check-vote-account")
+                .takes_value(false)
+                .conflicts_with("no_voting")
+                .requires("entrypoint")
+                .help("Skip the RPC vote account sanity check")
         )
         .arg(
             Arg::with_name("dev_no_sigverify")
@@ -749,6 +849,7 @@ pub fn main() {
     let cuda = matches.is_present("cuda");
     let no_genesis_fetch = matches.is_present("no_genesis_fetch");
     let no_snapshot_fetch = matches.is_present("no_snapshot_fetch");
+    let no_check_vote_account = matches.is_present("no_check_vote_account");
     let private_rpc = matches.is_present("private_rpc");
 
     // Canonicalize ledger path to avoid issues with symlink creation
@@ -788,6 +889,7 @@ pub fn main() {
             .map(|rpc_port| (rpc_port, rpc_port + 1)),
         voting_disabled: matches.is_present("no_voting"),
         wait_for_supermajority: !matches.is_present("no_wait_for_supermajority"),
+        trusted_validators,
         ..ValidatorConfig::default()
     };
 
@@ -836,7 +938,6 @@ pub fn main() {
         },
         snapshot_path,
         snapshot_package_output_path: ledger_path.clone(),
-        trusted_validators,
     });
 
     if matches.is_present("limit_ledger_size") {
@@ -994,53 +1095,88 @@ pub fn main() {
         );
 
         if !no_genesis_fetch {
-            let (rpc_client, rpc_addr) = get_rpc_addr(
-                &node,
+            let (cluster_info, gossip_exit_flag, gossip_service) = start_gossip_spy(
                 &identity_keypair,
                 &cluster_entrypoint.gossip,
-                validator_config.expected_shred_version,
-                validator_config
-                    .snapshot_config
-                    .as_ref()
-                    .unwrap()
-                    .trusted_validators
-                    .as_ref(),
-                no_snapshot_fetch,
+                node.sockets.gossip.try_clone().unwrap(),
             );
 
-            download_ledger(&rpc_addr, &ledger_path, no_snapshot_fetch).unwrap_or_else(|err| {
-                error!("Failed to initialize ledger: {}", err);
-                exit(1);
-            });
+            let mut blacklisted_rpc_nodes = HashSet::new();
+            loop {
+                let (rpc_contact_info, snapshot_hash) = get_rpc_node(
+                    &cluster_info,
+                    &validator_config,
+                    &mut blacklisted_rpc_nodes,
+                    no_snapshot_fetch,
+                );
+                info!(
+                    "Using RPC service from node {}: {:?}",
+                    rpc_contact_info.id, rpc_contact_info.rpc
+                );
+                let rpc_client = RpcClient::new_socket(rpc_contact_info.rpc);
 
-            let genesis_hash = rpc_client.get_genesis_hash().unwrap_or_else(|err| {
-                error!("Failed to get genesis hash: {}", err);
-                exit(1);
-            });
-
-            if let Some(expected_genesis_hash) = validator_config.expected_genesis_hash {
-                if expected_genesis_hash != genesis_hash {
-                    error!(
-                        "Genesis hash mismatch: expected {} but local genesis hash is {}",
-                        expected_genesis_hash, genesis_hash,
-                    );
-                    exit(1);
+                let result = match rpc_client.get_version() {
+                    Ok(rpc_version) => {
+                        info!("RPC node version: {}", rpc_version.solana_core);
+                        Ok(())
+                    }
+                    Err(err) => Err(format!("Failed to get RPC node version: {}", err)),
                 }
-            }
-            validator_config.expected_genesis_hash = Some(genesis_hash);
+                .and_then(|_| {
+                    download_genesis(
+                        &rpc_contact_info.rpc,
+                        &ledger_path,
+                        &mut validator_config,
+                    )
+                })
+                .and_then(|_| {
+                    if let Some(expected_genesis_hash) = validator_config.expected_genesis_hash {
+                        // Sanity check that the RPC node is using the expected genesis hash before
+                        // downloading a snapshot from it
+                        let rpc_genesis_hash = rpc_client
+                            .get_genesis_hash()
+                            .map_err(|err| format!("Failed to get genesis hash: {}", err))?;
 
-            if !validator_config.voting_disabled {
-                check_vote_account(
-                    &rpc_client,
-                    &vote_account,
-                    &voting_keypair.pubkey(),
-                    &identity_keypair.pubkey(),
-                )
-                .unwrap_or_else(|err| {
-                    error!("Failed to check vote account: {}", err);
-                    exit(1);
+                        if expected_genesis_hash != rpc_genesis_hash {
+                            return Err(format!("Genesis hash mismatch: expected {} but RPC node genesis hash is {}",
+                                               expected_genesis_hash, rpc_genesis_hash));
+                        }
+                    }
+                    Ok(())
+                })
+                .and_then(|_| download_snapshot(&rpc_contact_info.rpc, &ledger_path, snapshot_hash))
+                .and_then(|_| {
+                    if !validator_config.voting_disabled && !no_check_vote_account {
+                        check_vote_account(
+                            &rpc_client,
+                            &vote_account,
+                            &voting_keypair.pubkey(),
+                            &identity_keypair.pubkey(),
+                        )
+                    } else {
+                        Ok(())
+                    }
                 });
+
+                if result.is_ok() {
+                    break;
+                }
+                warn!("{}", result.unwrap_err());
+
+                if let Some(ref trusted_validators) = validator_config.trusted_validators {
+                    if trusted_validators.contains(&rpc_contact_info.id) {
+                        continue; // Never blacklist a trusted node
+                    }
+                }
+
+                info!(
+                    "Excluding {} as a future RPC candidate",
+                    rpc_contact_info.id
+                );
+                blacklisted_rpc_nodes.insert(rpc_contact_info.id);
             }
+            gossip_exit_flag.store(true, Ordering::Relaxed);
+            gossip_service.join().unwrap();
         }
     }
 

@@ -14,7 +14,7 @@ use solana_sdk::{
     rent::Rent,
     stake_history::{StakeHistory, StakeHistoryEntry},
 };
-use solana_vote_program::vote_state::VoteState;
+use solana_vote_program::vote_state::{VoteState, VoteStateVersions};
 use std::collections::HashSet;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
@@ -340,10 +340,18 @@ impl Authorized {
         new_authorized: &Pubkey,
         stake_authorize: StakeAuthorize,
     ) -> Result<(), InstructionError> {
-        self.check(signers, stake_authorize)?;
         match stake_authorize {
-            StakeAuthorize::Staker => self.staker = *new_authorized,
-            StakeAuthorize::Withdrawer => self.withdrawer = *new_authorized,
+            StakeAuthorize::Staker => {
+                // Allow either the staker or the withdrawer to change the staker key
+                if !signers.contains(&self.staker) && !signers.contains(&self.withdrawer) {
+                    return Err(InstructionError::MissingRequiredSignature);
+                }
+                self.staker = *new_authorized
+            }
+            StakeAuthorize::Withdrawer => {
+                self.check(signers, stake_authorize)?;
+                self.withdrawer = *new_authorized
+            }
         }
         Ok(())
     }
@@ -595,7 +603,7 @@ impl<'a> StakeAccount for KeyedAccount<'a> {
                 let stake = Stake::new(
                     self.lamports()?.saturating_sub(meta.rent_exempt_reserve), // can't stake the rent ;)
                     vote_account.unsigned_key(),
-                    &vote_account.state()?,
+                    &State::<VoteStateVersions>::state(vote_account)?.convert_to_current(),
                     clock.epoch,
                     config,
                 );
@@ -605,7 +613,7 @@ impl<'a> StakeAccount for KeyedAccount<'a> {
                 meta.authorized.check(signers, StakeAuthorize::Staker)?;
                 stake.redelegate(
                     vote_account.unsigned_key(),
-                    &vote_account.state()?,
+                    &State::<VoteStateVersions>::state(vote_account)?.convert_to_current(),
                     clock,
                     stake_history,
                     config,
@@ -778,7 +786,8 @@ pub fn redeem_rewards(
     stake_history: Option<&StakeHistory>,
 ) -> Result<(u64, u64), InstructionError> {
     if let StakeState::Stake(meta, mut stake) = stake_account.state()? {
-        let vote_state = vote_account.state()?;
+        let vote_state: VoteState =
+            StateMut::<VoteStateVersions>::state(vote_account)?.convert_to_current();
 
         if let Some((voters_reward, stakers_reward)) =
             stake.redeem_rewards(point_value, &vote_state, stake_history)
@@ -999,7 +1008,10 @@ mod tests {
             100,
         ));
         let vote_keyed_account = KeyedAccount::new(&vote_pubkey, false, &vote_account);
-        vote_keyed_account.set_state(&vote_state).unwrap();
+        let vote_state_credits = vote_state.credits();
+        vote_keyed_account
+            .set_state(&VoteStateVersions::Current(Box::new(vote_state)))
+            .unwrap();
 
         let stake_pubkey = Pubkey::new_rand();
         let stake_lamports = 42;
@@ -1057,7 +1069,7 @@ mod tests {
                     deactivation_epoch: std::u64::MAX,
                     ..Delegation::default()
                 },
-                credits_observed: vote_state.credits(),
+                credits_observed: vote_state_credits,
                 ..Stake::default()
             }
         );
@@ -1105,7 +1117,7 @@ mod tests {
                     deactivation_epoch: std::u64::MAX,
                     ..Delegation::default()
                 },
-                credits_observed: vote_state.credits(),
+                credits_observed: vote_state_credits,
                 ..Stake::default()
             }
         );
@@ -1535,7 +1547,9 @@ mod tests {
             100,
         ));
         let vote_keyed_account = KeyedAccount::new(&vote_pubkey, false, &vote_account);
-        vote_keyed_account.set_state(&VoteState::default()).unwrap();
+        vote_keyed_account
+            .set_state(&VoteStateVersions::Current(Box::new(VoteState::default())))
+            .unwrap();
         assert_eq!(
             stake_keyed_account.delegate(
                 &vote_keyed_account,
@@ -1624,7 +1638,9 @@ mod tests {
             100,
         ));
         let vote_keyed_account = KeyedAccount::new(&vote_pubkey, false, &vote_account);
-        vote_keyed_account.set_state(&VoteState::default()).unwrap();
+        vote_keyed_account
+            .set_state(&VoteStateVersions::Current(Box::new(VoteState::default())))
+            .unwrap();
 
         stake_keyed_account
             .delegate(
@@ -1748,7 +1764,9 @@ mod tests {
             100,
         ));
         let vote_keyed_account = KeyedAccount::new(&vote_pubkey, false, &vote_account);
-        vote_keyed_account.set_state(&VoteState::default()).unwrap();
+        vote_keyed_account
+            .set_state(&VoteStateVersions::Current(Box::new(VoteState::default())))
+            .unwrap();
         assert_eq!(
             stake_keyed_account.delegate(
                 &vote_keyed_account,
@@ -1857,7 +1875,9 @@ mod tests {
             100,
         ));
         let vote_keyed_account = KeyedAccount::new(&vote_pubkey, false, &vote_account);
-        vote_keyed_account.set_state(&VoteState::default()).unwrap();
+        vote_keyed_account
+            .set_state(&VoteStateVersions::Current(Box::new(VoteState::default())))
+            .unwrap();
         let signers = vec![stake_pubkey].into_iter().collect();
         assert_eq!(
             stake_keyed_account.delegate(
@@ -2257,6 +2277,83 @@ mod tests {
                 &clock,
                 &StakeHistory::default(),
                 &signers2,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_authorize_override() {
+        let withdrawer_pubkey = Pubkey::new_rand();
+        let stake_lamports = 42;
+        let stake_account = Account::new_ref_data_with_space(
+            stake_lamports,
+            &StakeState::Initialized(Meta::auto(&withdrawer_pubkey)),
+            std::mem::size_of::<StakeState>(),
+            &id(),
+        )
+        .expect("stake_account");
+
+        let stake_keyed_account = KeyedAccount::new(&withdrawer_pubkey, true, &stake_account);
+
+        // Authorize a staker pubkey and move the withdrawer key into cold storage.
+        let stake_pubkey = Pubkey::new_rand();
+        let signers = vec![withdrawer_pubkey].into_iter().collect();
+        assert_eq!(
+            stake_keyed_account.authorize(
+                &stake_pubkey,
+                StakeAuthorize::Staker,
+                &signers,
+                &Clock::default()
+            ),
+            Ok(())
+        );
+
+        // Attack! The stake key (a hot key) is stolen and used to authorize a new staker.
+        let mallory_pubkey = Pubkey::new_rand();
+        let signers = vec![stake_pubkey].into_iter().collect();
+        assert_eq!(
+            stake_keyed_account.authorize(
+                &mallory_pubkey,
+                StakeAuthorize::Staker,
+                &signers,
+                &Clock::default()
+            ),
+            Ok(())
+        );
+
+        // Verify the original staker no longer has access.
+        let new_stake_pubkey = Pubkey::new_rand();
+        assert_eq!(
+            stake_keyed_account.authorize(
+                &new_stake_pubkey,
+                StakeAuthorize::Staker,
+                &signers,
+                &Clock::default()
+            ),
+            Err(InstructionError::MissingRequiredSignature)
+        );
+
+        // Verify the withdrawer (pulled from cold storage) can save the day.
+        let signers = vec![withdrawer_pubkey].into_iter().collect();
+        assert_eq!(
+            stake_keyed_account.authorize(
+                &new_stake_pubkey,
+                StakeAuthorize::Withdrawer,
+                &signers,
+                &Clock::default()
+            ),
+            Ok(())
+        );
+
+        // Attack! Verify the staker cannot be used to authorize a withdraw.
+        let signers = vec![new_stake_pubkey].into_iter().collect();
+        assert_eq!(
+            stake_keyed_account.authorize(
+                &mallory_pubkey,
+                StakeAuthorize::Withdrawer,
+                &signers,
+                &Clock::default()
             ),
             Ok(())
         );

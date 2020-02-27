@@ -4,7 +4,7 @@ use crate::{
     cluster_info::ClusterInfo,
     commitment::{AggregateCommitmentService, BlockCommitmentCache, CommitmentAggregationData},
     consensus::{StakeLockout, Tower},
-    poh_recorder::PohRecorder,
+    poh_recorder::{PohRecorder, GRACE_TICKS_FACTOR, MAX_GRACE_SLOTS},
     result::Result,
     rewards_recorder_service::RewardsRecorderSender,
     rpc_subscriptions::RpcSubscriptions,
@@ -225,14 +225,7 @@ impl ReplayStage {
                         &subscriptions,
                         rewards_recorder_sender.clone(),
                     );
-                    datapoint_debug!(
-                        "replay_stage-memory",
-                        (
-                            "generate_new_bank_forks",
-                            (allocated.get() - start) as i64,
-                            i64
-                        ),
-                    );
+                    Self::report_memory(&allocated, "generate_new_bank_forks", start);
 
                     let mut tpu_has_bank = poh_recorder.lock().unwrap().has_bank();
 
@@ -246,10 +239,7 @@ impl ReplayStage {
                         transaction_status_sender.clone(),
                         &verify_recyclers,
                     );
-                    datapoint_debug!(
-                        "replay_stage-memory",
-                        ("replay_active_banks", (allocated.get() - start) as i64, i64),
-                    );
+                    Self::report_memory(&allocated, "replay_active_banks", start);
 
                     let ancestors = Arc::new(bank_forks.read().unwrap().ancestors());
                     loop {
@@ -287,11 +277,8 @@ impl ReplayStage {
                             }
                         }
 
-                        let vote_bank = Self::select_fork(&frozen_banks, &tower, &mut progress);
-                        datapoint_debug!(
-                            "replay_stage-memory",
-                            ("select_fork", (allocated.get() - start) as i64, i64),
-                        );
+                        let vote_bank = Self::select_fork(&frozen_banks, &tower, &progress);
+                        Self::report_memory(&allocated, "select_fork", start);
                         if vote_bank.is_none() {
                             break;
                         }
@@ -339,10 +326,7 @@ impl ReplayStage {
                                 &latest_root_senders,
                             )?;
                         }
-                        datapoint_debug!(
-                            "replay_stage-memory",
-                            ("votable_bank", (allocated.get() - start) as i64, i64),
-                        );
+                        Self::report_memory(&allocated, "votable_bank", start);
                         let start = allocated.get();
                         if last_reset != bank.last_blockhash() {
                             Self::reset_poh_recorder(
@@ -383,10 +367,7 @@ impl ReplayStage {
                         } else {
                             done = true;
                         }
-                        datapoint_debug!(
-                            "replay_stage-memory",
-                            ("reset_bank", (allocated.get() - start) as i64, i64),
-                        );
+                        Self::report_memory(&allocated, "reset_bank", start);
                         if done {
                             break;
                         }
@@ -412,10 +393,7 @@ impl ReplayStage {
                             );
                         }
                     }
-                    datapoint_debug!(
-                        "replay_stage-memory",
-                        ("start_leader", (allocated.get() - start) as i64, i64),
-                    );
+                    Self::report_memory(&allocated, "start_leader", start);
                     datapoint_debug!(
                         "replay_stage",
                         ("duration", duration_as_ms(&now.elapsed()) as i64, i64)
@@ -442,6 +420,17 @@ impl ReplayStage {
             },
             root_bank_receiver,
         )
+    }
+
+    fn report_memory(
+        allocated: &solana_measure::thread_mem_usage::Allocatedp,
+        name: &'static str,
+        start: u64,
+    ) {
+        datapoint_debug!(
+            "replay_stage-memory",
+            (name, (allocated.get() - start) as i64, i64),
+        );
     }
 
     fn log_leader_change(
@@ -534,13 +523,17 @@ impl ReplayStage {
                 "new fork:{} parent:{} (leader) root:{}",
                 poh_slot, parent_slot, root_slot
             );
-            subscriptions.notify_slot(poh_slot, parent_slot, root_slot);
-            let tpu_bank = bank_forks
-                .write()
-                .unwrap()
-                .insert(Bank::new_from_parent(&parent, my_pubkey, poh_slot));
 
-            Self::record_rewards(&tpu_bank, &rewards_recorder_sender);
+            let tpu_bank = Self::new_bank_from_parent_with_notify(
+                &parent,
+                poh_slot,
+                root_slot,
+                my_pubkey,
+                &rewards_recorder_sender,
+                subscriptions,
+            );
+
+            let tpu_bank = bank_forks.write().unwrap().insert(tpu_bank);
             poh_recorder.lock().unwrap().set_bank(&tpu_bank);
         } else {
             error!("{} No next leader found", my_pubkey);
@@ -690,6 +683,7 @@ impl ReplayStage {
             bank.slot(),
             &bank,
             Some(blockstore),
+            GRACE_TICKS_FACTOR * MAX_GRACE_SLOTS,
         );
         poh_recorder
             .lock()
@@ -848,7 +842,7 @@ impl ReplayStage {
     pub(crate) fn select_fork(
         frozen_banks: &[Arc<Bank>],
         tower: &Tower,
-        progress: &mut HashMap<u64, ForkProgress>,
+        progress: &HashMap<u64, ForkProgress>,
     ) -> Option<Arc<Bank>> {
         let tower_start = Instant::now();
         let num_frozen_banks = frozen_banks.len();
@@ -1019,10 +1013,14 @@ impl ReplayStage {
                     parent_slot,
                     forks.root()
                 );
-                subscriptions.notify_slot(child_slot, parent_slot, forks.root());
-
-                let child_bank = Bank::new_from_parent(&parent_bank, &leader, child_slot);
-                Self::record_rewards(&child_bank, &rewards_recorder_sender);
+                let child_bank = Self::new_bank_from_parent_with_notify(
+                    &parent_bank,
+                    child_slot,
+                    forks.root(),
+                    &leader,
+                    &rewards_recorder_sender,
+                    subscriptions,
+                );
                 new_banks.insert(child_slot, child_bank);
             }
         }
@@ -1032,6 +1030,21 @@ impl ReplayStage {
         for (_, bank) in new_banks {
             forks.insert(bank);
         }
+    }
+
+    fn new_bank_from_parent_with_notify(
+        parent: &Arc<Bank>,
+        slot: u64,
+        root_slot: u64,
+        leader: &Pubkey,
+        rewards_recorder_sender: &Option<RewardsRecorderSender>,
+        subscriptions: &Arc<RpcSubscriptions>,
+    ) -> Bank {
+        subscriptions.notify_slot(slot, parent.slot(), root_slot);
+
+        let child_bank = Bank::new_from_parent(parent, leader, slot);
+        Self::record_rewards(&child_bank, &rewards_recorder_sender);
+        child_bank
     }
 
     fn record_rewards(bank: &Bank, rewards_recorder_sender: &Option<RewardsRecorderSender>) {
@@ -1055,7 +1068,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         commitment::BlockCommitment,
-        consensus::test::{initialize_state, VoteResult, VoteSimulator},
+        consensus::test::{initialize_state, VoteSimulator},
         consensus::Tower,
         genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
         replay_stage::ReplayStage,
@@ -1087,7 +1100,7 @@ pub(crate) mod tests {
         transaction::TransactionError,
     };
     use solana_stake_program::stake_state;
-    use solana_vote_program::vote_state::{self, Vote, VoteState};
+    use solana_vote_program::vote_state::{self, Vote, VoteState, VoteStateVersions};
     use std::{
         fs::remove_dir_all,
         iter,
@@ -1122,7 +1135,8 @@ pub(crate) mod tests {
             let mut vote_account = bank.get_account(&pubkey).unwrap();
             let mut vote_state = VoteState::from(&vote_account).unwrap();
             vote_state.process_slot_vote_unchecked(slot);
-            vote_state.to(&mut vote_account).unwrap();
+            let versioned = VoteStateVersions::Current(Box::new(vote_state));
+            VoteState::to(&versioned, &mut vote_account).unwrap();
             bank.store_account(&pubkey, &vote_account);
         }
 
@@ -1298,7 +1312,7 @@ pub(crate) mod tests {
                     &mut fork_progresses[i],
                 );
                 let response =
-                    ReplayStage::select_fork(&frozen_banks, &towers[i], &mut fork_progresses[i]);
+                    ReplayStage::select_fork(&frozen_banks, &towers[i], &fork_progresses[i]);
 
                 if response.is_none() {
                     None
@@ -1706,7 +1720,8 @@ pub(crate) mod tests {
             let mut leader_vote_account = bank.get_account(&pubkey).unwrap();
             let mut vote_state = VoteState::from(&leader_vote_account).unwrap();
             vote_state.process_slot_vote_unchecked(bank.slot());
-            vote_state.to(&mut leader_vote_account).unwrap();
+            let versioned = VoteStateVersions::Current(Box::new(vote_state));
+            VoteState::to(&versioned, &mut leader_vote_account).unwrap();
             bank.store_account(&pubkey, &leader_vote_account);
         }
 
@@ -1937,8 +1952,8 @@ pub(crate) mod tests {
         let mut cluster_votes: HashMap<Pubkey, Vec<Slot>> = HashMap::new();
         let votes: Vec<Slot> = vec![0, 2];
         for vote in &votes {
-            assert_eq!(
-                voting_simulator.simulate_vote(
+            assert!(voting_simulator
+                .simulate_vote(
                     *vote,
                     &bank_forks,
                     &mut cluster_votes,
@@ -1946,9 +1961,8 @@ pub(crate) mod tests {
                     keypairs.get(&node_pubkey).unwrap(),
                     &mut progress,
                     &mut tower,
-                ),
-                VoteResult::Ok
-            );
+                )
+                .is_empty());
         }
 
         let mut frozen_banks: Vec<_> = bank_forks

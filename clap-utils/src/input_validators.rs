@@ -1,6 +1,5 @@
 use crate::keypair::{parse_keypair_path, KeypairUrl, ASK_KEYWORD};
 use chrono::DateTime;
-use solana_remote_wallet::remote_keypair::generate_remote_keypair;
 use solana_sdk::{
     hash::Hash,
     pubkey::Pubkey,
@@ -53,9 +52,6 @@ pub fn is_pubkey_or_keypair_or_ask_keyword(string: String) -> Result<(), String>
 
 pub fn is_valid_signer(string: String) -> Result<(), String> {
     match parse_keypair_path(&string) {
-        KeypairUrl::Usb(path) => generate_remote_keypair(path, None)
-            .map(|_| ())
-            .map_err(|err| format!("{:?}", err)),
         KeypairUrl::Filepath(path) => is_keypair(path),
         _ => Ok(()),
     }
@@ -146,7 +142,7 @@ pub fn is_derivation(value: String) -> Result<(), String> {
     let mut parts = value.split('/');
     let account = parts.next().unwrap();
     account
-        .parse::<u16>()
+        .parse::<u32>()
         .map_err(|e| {
             format!(
                 "Unable to parse derivation, provided: {}, err: {:?}",
@@ -155,7 +151,7 @@ pub fn is_derivation(value: String) -> Result<(), String> {
         })
         .and_then(|_| {
             if let Some(change) = parts.next() {
-                change.parse::<u16>().map_err(|e| {
+                change.parse::<u32>().map_err(|e| {
                     format!(
                         "Unable to parse derivation, provided: {}, err: {:?}",
                         change, e
@@ -176,11 +172,12 @@ mod tests {
     fn test_is_derivation() {
         assert_eq!(is_derivation("2".to_string()), Ok(()));
         assert_eq!(is_derivation("0".to_string()), Ok(()));
+        assert_eq!(is_derivation("65537".to_string()), Ok(()));
         assert_eq!(is_derivation("0/2".to_string()), Ok(()));
         assert_eq!(is_derivation("0'/2'".to_string()), Ok(()));
         assert!(is_derivation("a".to_string()).is_err());
-        assert!(is_derivation("65537".to_string()).is_err());
+        assert!(is_derivation("4294967296".to_string()).is_err());
         assert!(is_derivation("a/b".to_string()).is_err());
-        assert!(is_derivation("0/65537".to_string()).is_err());
+        assert!(is_derivation("0/4294967296".to_string()).is_err());
     }
 }

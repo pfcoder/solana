@@ -17,6 +17,7 @@ use solana_sdk::{
     system_instruction,
     sysvar::{self, clock::Clock, slot_hashes::SlotHashes, Sysvar},
 };
+use std::collections::HashSet;
 use thiserror::Error;
 
 /// Reasons the stake might have had an error
@@ -138,8 +139,11 @@ pub fn update_node(
     authorized_voter_pubkey: &Pubkey,
     node_pubkey: &Pubkey,
 ) -> Instruction {
-    let account_metas =
-        vec![AccountMeta::new(*vote_pubkey, false)].with_signer(authorized_voter_pubkey);
+    let account_metas = vec![
+        AccountMeta::new(*vote_pubkey, false),
+        AccountMeta::new_readonly(sysvar::clock::id(), false),
+    ]
+    .with_signer(authorized_voter_pubkey);
 
     Instruction::new(
         id(),
@@ -184,7 +188,7 @@ pub fn process_instruction(
     trace!("process_instruction: {:?}", data);
     trace!("keyed_accounts: {:?}", keyed_accounts);
 
-    let signers = get_signers(keyed_accounts);
+    let signers: HashSet<Pubkey> = get_signers(keyed_accounts);
 
     let keyed_accounts = &mut keyed_accounts.iter();
     let me = &mut next_keyed_account(keyed_accounts)?;
@@ -205,9 +209,12 @@ pub fn process_instruction(
             &signers,
             &Clock::from_keyed_account(next_keyed_account(keyed_accounts)?)?,
         ),
-        VoteInstruction::UpdateNode(node_pubkey) => {
-            vote_state::update_node(me, &node_pubkey, &signers)
-        }
+        VoteInstruction::UpdateNode(node_pubkey) => vote_state::update_node(
+            me,
+            &node_pubkey,
+            &signers,
+            &Clock::from_keyed_account(next_keyed_account(keyed_accounts)?)?,
+        ),
         VoteInstruction::Vote(vote) => {
             inc_new_counter_info!("vote-native", 1);
             vote_state::process_vote(
