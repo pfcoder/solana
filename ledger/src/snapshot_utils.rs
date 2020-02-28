@@ -3,6 +3,7 @@ use bincode::serialize_into;
 use bzip2::bufread::BzDecoder;
 use fs_extra::dir::CopyOptions;
 use log::*;
+use regex::Regex;
 use solana_measure::measure::Measure;
 use solana_runtime::{
     accounts_db::{SnapshotStorage, SnapshotStorages},
@@ -11,7 +12,7 @@ use solana_runtime::{
         MAX_SNAPSHOT_DATA_FILE_SIZE,
     },
 };
-use solana_sdk::clock::Slot;
+use solana_sdk::{clock::Slot, hash::Hash};
 use std::{
     cmp::Ordering,
     env,
@@ -28,6 +29,8 @@ pub const SNAPSHOT_STATUS_CACHE_FILE_NAME: &str = "status_cache";
 pub const TAR_SNAPSHOTS_DIR: &str = "snapshots";
 pub const TAR_ACCOUNTS_DIR: &str = "accounts";
 pub const TAR_VERSION_FILE: &str = "version";
+
+pub const SNAPSHOT_VERSION: &str = "1.0.0";
 
 #[derive(PartialEq, Ord, Eq, Debug)]
 pub struct SlotSnapshotPaths {
@@ -79,9 +82,9 @@ impl SlotSnapshotPaths {
 pub fn package_snapshot<P: AsRef<Path>, Q: AsRef<Path>>(
     bank: &Bank,
     snapshot_files: &SlotSnapshotPaths,
-    snapshot_package_output_file: P,
     snapshot_path: Q,
     slots_to_snapshot: &[Slot],
+    snapshot_package_output_path: P,
     snapshot_storages: SnapshotStorages,
 ) -> Result<SnapshotPackage> {
     // Hard link all the snapshots we need for this package
@@ -98,12 +101,17 @@ pub fn package_snapshot<P: AsRef<Path>, Q: AsRef<Path>>(
     // any temporary state created for the SnapshotPackage (like the snapshot_hard_links_dir)
     snapshot_files.copy_snapshot_directory(snapshot_hard_links_dir.path())?;
 
+    let snapshot_package_output_file = get_snapshot_archive_path(
+        &snapshot_package_output_path,
+        &(bank.slot(), bank.get_accounts_hash()),
+    );
+
     let package = SnapshotPackage::new(
         bank.slot(),
         bank.src.slot_deltas(slots_to_snapshot),
         snapshot_hard_links_dir,
         snapshot_storages,
-        snapshot_package_output_file.as_ref().to_path_buf(),
+        snapshot_package_output_file,
         bank.get_accounts_hash(),
     );
 
@@ -165,10 +173,8 @@ pub fn archive_snapshot_package(snapshot_package: &SnapshotPackage) -> Result<()
 
     // Write version file
     {
-        let snapshot_version = format!("{}\n", env!("CARGO_PKG_VERSION"));
         let mut f = std::fs::File::create(staging_version_file)?;
-        //f.write_all(&snapshot_version.to_string().into_bytes())?;
-        f.write_all(&snapshot_version.into_bytes())?;
+        f.write_all(&SNAPSHOT_VERSION.to_string().into_bytes())?;
     }
 
     let archive_compress_options = if is_snapshot_compression_disabled() {
@@ -205,9 +211,17 @@ pub fn archive_snapshot_package(snapshot_package: &SnapshotPackage) -> Result<()
     let metadata = fs::metadata(&archive_path)?;
     fs::rename(&archive_path, &snapshot_package.tar_output_file)?;
 
+    // Keep around at most two snapshot archives
+    let archives = get_snapshot_archives(snapshot_package.tar_output_file.parent().unwrap());
+    for old_archive in archives.into_iter().skip(2) {
+        fs::remove_file(old_archive.0)
+            .unwrap_or_else(|err| info!("Failed to remove old snapshot: {:}", err));
+    }
+
     timer.stop();
     info!(
-        "Successfully created tarball. slot: {}, elapsed ms: {}, size={}",
+        "Successfully created {:?}. slot: {}, elapsed ms: {}, size={}",
+        snapshot_package.tar_output_file,
         snapshot_package.root,
         timer.as_ms(),
         metadata.len()
@@ -416,32 +430,6 @@ pub fn remove_snapshot<P: AsRef<Path>>(slot: Slot, snapshot_path: P) -> Result<(
     Ok(())
 }
 
-pub fn bank_slot_from_archive<P: AsRef<Path>>(snapshot_tar: P) -> Result<Slot> {
-    let tempdir = tempfile::TempDir::new()?;
-    untar_snapshot_in(&snapshot_tar, &tempdir)?;
-    let unpacked_snapshots_dir = tempdir.path().join(TAR_SNAPSHOTS_DIR);
-    let local_account_paths = vec![tempdir.path().join("account_dummy")];
-    let unpacked_accounts_dir = tempdir.path().join(TAR_ACCOUNTS_DIR);
-    let snapshot_paths = get_snapshot_paths(&unpacked_snapshots_dir);
-    let last_root_paths = snapshot_paths
-        .last()
-        .ok_or_else(|| get_io_error("No snapshots found in snapshots directory"))?;
-    let bank = deserialize_snapshot_data_file(
-        &last_root_paths.snapshot_file_path,
-        MAX_SNAPSHOT_DATA_FILE_SIZE,
-        |stream| {
-            let bank: Bank = deserialize_from_snapshot(stream.by_ref())?;
-            bank.rc.accounts_from_stream(
-                stream.by_ref(),
-                &local_account_paths,
-                &unpacked_accounts_dir,
-            )?;
-            Ok(bank)
-        },
-    )?;
-    Ok(bank.slot())
-}
-
 pub fn bank_from_archive<P: AsRef<Path>>(
     account_paths: &[PathBuf],
     snapshot_path: &PathBuf,
@@ -456,15 +444,8 @@ pub fn bank_from_archive<P: AsRef<Path>>(
     let unpacked_snapshots_dir = unpack_dir.as_ref().join(TAR_SNAPSHOTS_DIR);
     let unpacked_version_file = unpack_dir.as_ref().join(TAR_VERSION_FILE);
 
-    let snapshot_version = if let Ok(mut f) = File::open(unpacked_version_file) {
-        let mut snapshot_version = String::new();
-        f.read_to_string(&mut snapshot_version)?;
-        snapshot_version
-    } else {
-        // Once v0.23.x is deployed, this default can be removed and snapshots without a version
-        // file can be rejected
-        String::from("0.22.3")
-    };
+    let mut snapshot_version = String::new();
+    File::open(unpacked_version_file).and_then(|mut f| f.read_to_string(&mut snapshot_version))?;
 
     let bank = rebuild_bank_from_snapshots(
         snapshot_version.trim(),
@@ -504,8 +485,59 @@ fn is_snapshot_compression_disabled() -> bool {
     }
 }
 
-pub fn get_snapshot_archive_path<P: AsRef<Path>>(snapshot_output_dir: P) -> PathBuf {
-    snapshot_output_dir.as_ref().join("snapshot.tar.bz2")
+pub fn get_snapshot_archive_path<P: AsRef<Path>>(
+    snapshot_output_dir: P,
+    snapshot_hash: &(Slot, Hash),
+) -> PathBuf {
+    snapshot_output_dir.as_ref().join(format!(
+        "snapshot-{}-{}.tar.bz2",
+        snapshot_hash.0, snapshot_hash.1
+    ))
+}
+
+fn snapshot_hash_of(archive_filename: &str) -> Option<(Slot, Hash)> {
+    let snapshot_filename_regex = Regex::new(r"snapshot-(\d+)-([[:alnum:]]+)\.tar\.bz2$").unwrap();
+
+    if let Some(captures) = snapshot_filename_regex.captures(archive_filename) {
+        let slot_str = captures.get(1).unwrap().as_str();
+        let hash_str = captures.get(2).unwrap().as_str();
+
+        if let (Ok(slot), Ok(hash)) = (slot_str.parse::<Slot>(), hash_str.parse::<Hash>()) {
+            return Some((slot, hash));
+        }
+    }
+    None
+}
+
+fn get_snapshot_archives<P: AsRef<Path>>(snapshot_output_dir: P) -> Vec<(PathBuf, (Slot, Hash))> {
+    let files = fs::read_dir(&snapshot_output_dir)
+        .unwrap_or_else(|err| panic!("Unable to read snapshot directory: {}", err));
+
+    let mut archives: Vec<_> = files
+        .filter_map(|entry| {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(snapshot_hash) =
+                        snapshot_hash_of(path.file_name().unwrap().to_str().unwrap())
+                    {
+                        return Some((path, snapshot_hash));
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
+    archives.sort_by(|a, b| (b.1).0.cmp(&(a.1).0)); // reverse sort by slot
+    archives
+}
+
+pub fn get_highest_snapshot_archive_path<P: AsRef<Path>>(
+    snapshot_output_dir: P,
+) -> Option<(PathBuf, (Slot, Hash))> {
+    let archives = get_snapshot_archives(snapshot_output_dir);
+    archives.into_iter().next()
 }
 
 pub fn untar_snapshot_in<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -558,7 +590,7 @@ where
         MAX_SNAPSHOT_DATA_FILE_SIZE,
         |stream| {
             let mut bank: Bank = match snapshot_version {
-                env!("CARGO_PKG_VERSION") => deserialize_from_snapshot(stream.by_ref())?,
+                SNAPSHOT_VERSION => deserialize_from_snapshot(stream.by_ref())?,
                 _ => {
                     return Err(get_io_error(&format!(
                         "unsupported snapshot version: {}",
@@ -608,7 +640,7 @@ fn get_io_error(error: &str) -> SnapshotError {
 }
 
 pub fn verify_snapshot_archive<P, Q, R>(
-    snapshot_tar: P,
+    snapshot_archive: P,
     snapshots_to_verify: Q,
     storages_to_verify: R,
 ) where
@@ -618,7 +650,7 @@ pub fn verify_snapshot_archive<P, Q, R>(
 {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let unpack_dir = temp_dir.path();
-    untar_snapshot_in(snapshot_tar, &unpack_dir).unwrap();
+    untar_snapshot_in(snapshot_archive, &unpack_dir).unwrap();
 
     // Check snapshots are the same
     let unpacked_snapshots = unpack_dir.join(&TAR_SNAPSHOTS_DIR);
@@ -739,5 +771,14 @@ mod tests {
             |stream| Ok(deserialize_from::<_, u32>(stream)?),
         );
         assert_matches!(result, Err(SnapshotError::IO(ref message)) if message.to_string().starts_with("invalid snapshot data file"));
+    }
+
+    #[test]
+    fn test_snapshot_hash_of() {
+        assert_eq!(
+            snapshot_hash_of(&format!("snapshot-42-{}.tar.bz2", Hash::default())),
+            Some((42, Hash::default()))
+        );
+        assert!(snapshot_hash_of("invalid").is_none());
     }
 }

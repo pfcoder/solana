@@ -16,6 +16,7 @@ use solana_stake_program::{
 pub struct StakerInfo {
     pub name: &'static str,
     pub staker: &'static str,
+    pub withdrawer: Option<&'static str>,
     pub lamports: u64,
 }
 
@@ -41,14 +42,22 @@ pub fn create_and_add_stakes(
     // description of how the stakes' lockups will expire
     unlock_info: &UnlockInfo,
     // the largest each stake account should be, in lamports
-    granularity: u64,
+    granularity: Option<u64>,
 ) -> u64 {
-    let authorized = Authorized::auto(
-        &staker_info
-            .staker
-            .parse::<Pubkey>()
-            .expect("invalid staker"),
-    );
+    let granularity = granularity.unwrap_or(std::u64::MAX);
+    let staker = &staker_info
+        .staker
+        .parse::<Pubkey>()
+        .expect("invalid staker");
+    let withdrawer = &staker_info
+        .withdrawer
+        .unwrap_or(staker_info.staker)
+        .parse::<Pubkey>()
+        .expect("invalid staker");
+    let authorized = Authorized {
+        staker: *staker,
+        withdrawer: *withdrawer,
+    };
     let custodian = unlock_info
         .custodian
         .parse::<Pubkey>()
@@ -163,7 +172,7 @@ mod tests {
     ) {
         assert_eq!(
             total_lamports,
-            create_and_add_stakes(genesis_config, staker_info, unlock_info, granularity)
+            create_and_add_stakes(genesis_config, staker_info, unlock_info, Some(granularity))
         );
         assert_eq!(genesis_config.accounts.len(), len);
         assert_eq!(
@@ -239,6 +248,7 @@ mod tests {
                 name: "fun",
                 staker: "P1aceHo1derPubkey11111111111111111111111111",
                 lamports: total_lamports,
+                withdrawer: None,
             },
             &UnlockInfo {
                 cliff_fraction: 0.5,
@@ -264,6 +274,7 @@ mod tests {
                 name: "fun",
                 staker: "P1aceHo1derPubkey11111111111111111111111111",
                 lamports: total_lamports,
+                withdrawer: None,
             },
             &UnlockInfo {
                 cliff_fraction: 0.5,
@@ -289,6 +300,7 @@ mod tests {
                 name: "fun",
                 staker: "P1aceHo1derPubkey11111111111111111111111111",
                 lamports: total_lamports,
+                withdrawer: None,
             },
             &UnlockInfo {
                 cliff_fraction: 0.5,
@@ -313,6 +325,7 @@ mod tests {
                 name: "fun",
                 staker: "P1aceHo1derPubkey11111111111111111111111111",
                 lamports: total_lamports,
+                withdrawer: None,
             },
             &UnlockInfo {
                 cliff_fraction: 0.5,
