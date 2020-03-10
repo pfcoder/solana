@@ -71,6 +71,12 @@ function wait_for_bootstrap_validator_stake_drop {
   done
 }
 
+function get_slot {
+  source net/common.sh
+  loadConfigFile
+  ssh "${sshOptions[@]}" "${validatorIpList[0]}" '$HOME/.cargo/bin/solana slot'
+}
+
 function cleanup_testnet {
   RC=$?
   if [[ $RC != 0 ]]; then
@@ -130,6 +136,7 @@ function launchTestnet() {
         $maybeCustomMachineType "$VALIDATOR_NODE_MACHINE_TYPE" $maybeEnableGpu \
         -p "$TESTNET_TAG" $maybeCreateAllowBootFailures $maybePublicIpAddresses \
         ${TESTNET_CLOUD_ZONES[@]/#/"-z "} \
+        --self-destruct-hours 0 \
         ${ADDITIONAL_FLAGS[@]/#/" "}
       ;;
     ec2)
@@ -182,23 +189,33 @@ function launchTestnet() {
     net/net.sh stop
   fi
 
-  execution_step "Start ${NUMBER_OF_VALIDATOR_NODES} node test"
+  execution_step "Starting bootstrap node and ${NUMBER_OF_VALIDATOR_NODES} validator nodes"
   if [[ -n $CHANNEL ]]; then
     # shellcheck disable=SC2068
     # shellcheck disable=SC2086
     net/net.sh start -t "$CHANNEL" \
-      "$maybeClientOptions" "$CLIENT_OPTIONS" $maybeStartAllowBootFailures \
-      --gpu-mode $startGpuMode --client-delay-start $CLIENT_DELAY_START
+      -c idle=$NUMBER_OF_CLIENT_NODES $maybeStartAllowBootFailures \
+      --gpu-mode $startGpuMode
   else
     # shellcheck disable=SC2068
     # shellcheck disable=SC2086
     net/net.sh start -T solana-release*.tar.bz2 \
-      "$maybeClientOptions" "$CLIENT_OPTIONS" $maybeStartAllowBootFailures \
-      --gpu-mode $startGpuMode --client-delay-start $CLIENT_DELAY_START
+      -c idle=$NUMBER_OF_CLIENT_NODES $maybeStartAllowBootFailures \
+      --gpu-mode $startGpuMode
   fi
 
-  execution_step "Waiting for bootstrap validator's stake percentage to fall below $BOOTSTRAP_VALIDATOR_MAX_STAKE_THRESHOLD %"
+  execution_step "Waiting for bootstrap validator's stake to fall below ${BOOTSTRAP_VALIDATOR_MAX_STAKE_THRESHOLD}%"
   wait_for_bootstrap_validator_stake_drop "$BOOTSTRAP_VALIDATOR_MAX_STAKE_THRESHOLD"
+
+  if [[ $NUMBER_OF_CLIENT_NODES -gt 0 ]]; then
+    execution_step "Starting ${NUMBER_OF_CLIENT_NODES} client nodes"
+    net/net.sh startclients "$maybeClientOptions" "$CLIENT_OPTIONS"
+  fi
+
+  SECONDS=0
+  START_SLOT=$(get_slot)
+  SLOT_COUNT_START_SECONDS=$SECONDS
+  execution_step "Marking beginning of slot rate test - Slot: $START_SLOT, Seconds: $SLOT_COUNT_START_SECONDS"
 
   if [[ -n $TEST_DURATION_SECONDS ]]; then
     execution_step "Wait ${TEST_DURATION_SECONDS} seconds to complete test"
@@ -222,8 +239,16 @@ function launchTestnet() {
   else
     # We should never get here
     echo Test duration and partition config not defined
+    exit 1
   fi
-  
+
+  END_SLOT=$(get_slot)
+  SLOT_COUNT_END_SECONDS=$SECONDS
+  execution_step "Marking end of slot rate test - Slot: $END_SLOT, Seconds: $SLOT_COUNT_END_SECONDS"
+
+  SLOTS_PER_SECOND="$(bc <<< "scale=3; ($END_SLOT - $START_SLOT)/($SLOT_COUNT_END_SECONDS - $SLOT_COUNT_START_SECONDS)")"
+  execution_step "Average slot rate: $SLOTS_PER_SECOND slots/second over $((SLOT_COUNT_END_SECONDS - SLOT_COUNT_START_SECONDS)) seconds"
+
   execution_step "Collect statistics about run"
   declare q_mean_tps='
     SELECT ROUND(MEAN("median_sum")) as "mean_tps" FROM (
@@ -277,6 +302,8 @@ function launchTestnet() {
     --data-urlencode "db=${TESTNET_TAG}" \
     --data-urlencode "q=$q_mean_tps;$q_max_tps;$q_mean_confirmation;$q_max_confirmation;$q_99th_confirmation;$q_max_tower_distance_observed;$q_last_tower_distance_observed" |
     python system-test/testnet-automation-json-parser.py >>"$RESULT_FILE"
+
+  echo "slots_per_second: $SLOTS_PER_SECOND" >>"$RESULT_FILE"
 
   execution_step "Writing test results to ${RESULT_FILE}"
   RESULT_DETAILS=$(<"$RESULT_FILE")

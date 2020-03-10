@@ -549,23 +549,26 @@ impl AccountsDB {
                         AppendVec::new_relative_path(slot_id, storage_entry.id);
                     let append_vec_abs_path =
                         append_vecs_path.as_ref().join(&append_vec_relative_path);
-                    let mut copy_options = CopyOptions::new();
-                    copy_options.overwrite = true;
-                    let e = fs_extra::move_items(
-                        &vec![&append_vec_abs_path],
-                        &local_dir,
-                        &copy_options,
-                    )
-                    .map_err(|e| {
-                        AccountsDB::get_io_error(&format!(
-                            "Unable to move {:?} to {:?}: {}",
-                            append_vec_abs_path, local_dir, e
-                        ))
-                    });
-                    if e.is_err() {
-                        info!("{:?}", e);
-                        continue;
-                    }
+                    let target = local_dir.join(append_vec_abs_path.file_name().unwrap());
+                    if std::fs::rename(append_vec_abs_path.clone(), target).is_err() {
+                        let mut copy_options = CopyOptions::new();
+                        copy_options.overwrite = true;
+                        let e = fs_extra::move_items(
+                            &vec![&append_vec_abs_path],
+                            &local_dir,
+                            &copy_options,
+                        )
+                        .map_err(|e| {
+                            AccountsDB::get_io_error(&format!(
+                                "Unable to move {:?} to {:?}: {}",
+                                append_vec_abs_path, local_dir, e
+                            ))
+                        });
+                        if e.is_err() {
+                            info!("{:?}", e);
+                            continue;
+                        }
+                    };
 
                     // Notify the AppendVec of the new file location
                     let local_path = local_dir.join(append_vec_relative_path);
@@ -635,18 +638,67 @@ impl AccountsDB {
         false
     }
 
-    // Purge zero lamport accounts for garbage collection purposes
+    // Reclaim older states of rooted non-zero lamport accounts as a general
+    // AccountsDB bloat mitigation and preprocess for better zero-lamport purging.
+    fn clean_old_rooted_accounts(&self, purges_in_root: Vec<Pubkey>) {
+        // This number isn't carefully chosen; just guessed randomly such that
+        // the hot loop will be the order of ~Xms.
+        const INDEX_CLEAN_BULK_COUNT: usize = 4096;
+
+        let mut measure = Measure::start("clean_old_root-ms");
+        let reclaim_vecs =
+            purges_in_root
+                .par_chunks(INDEX_CLEAN_BULK_COUNT)
+                .map(|pubkeys: &[Pubkey]| {
+                    let mut reclaims = Vec::new();
+                    let accounts_index = self.accounts_index.read().unwrap();
+                    for pubkey in pubkeys {
+                        accounts_index.clean_rooted_entries(&pubkey, &mut reclaims);
+                    }
+                    reclaims
+                });
+        let reclaims: Vec<_> = reclaim_vecs.flatten().collect();
+        measure.stop();
+        inc_new_counter_info!("clean-old-root-par-clean-ms", measure.as_ms() as usize);
+
+        let mut measure = Measure::start("clean_old_root-ms");
+        self.handle_reclaims(&reclaims);
+        measure.stop();
+        inc_new_counter_info!("clean-old-root-reclaim-ms", measure.as_ms() as usize);
+    }
+
+    fn clear_uncleaned_roots(&self) {
+        let mut accounts_index = self.accounts_index.write().unwrap();
+        accounts_index.uncleaned_roots.clear();
+        drop(accounts_index);
+    }
+
+    // Purge zero lamport accounts and older rooted account states as garbage
+    // collection
     // Only remove those accounts where the entire rooted history of the account
     // can be purged because there are no live append vecs in the ancestors
-    pub fn purge_zero_lamport_accounts(&self, ancestors: &HashMap<u64, usize>) {
+    pub fn clean_accounts(&self) {
         self.report_store_stats();
         let mut purges = HashMap::new();
+        let mut purges_in_root = Vec::new();
+        let no_ancestors = HashMap::new();
         let accounts_index = self.accounts_index.read().unwrap();
-        accounts_index.scan_accounts(ancestors, |pubkey, (account_info, slot)| {
-            if account_info.lamports == 0 && accounts_index.is_root(slot) {
+
+        accounts_index.scan_accounts(&no_ancestors, |pubkey, (account_info, slot)| {
+            if account_info.lamports == 0 {
                 purges.insert(*pubkey, accounts_index.would_purge(pubkey));
+            } else if accounts_index.uncleaned_roots.contains(&slot) {
+                purges_in_root.push(*pubkey);
             }
         });
+        drop(accounts_index);
+
+        if !purges_in_root.is_empty() {
+            self.clean_old_rooted_accounts(purges_in_root);
+        }
+        self.clear_uncleaned_roots();
+
+        let accounts_index = self.accounts_index.read().unwrap();
 
         // Calculate store counts as if everything was purged
         // Then purge if we can
@@ -722,9 +774,9 @@ impl AccountsDB {
         let mut dead_slots = self.remove_dead_accounts(reclaims);
         dead_accounts.stop();
 
-        let mut cleanup_dead_slots = Measure::start("reclaims::purge_slots");
-        self.cleanup_dead_slots(&mut dead_slots);
-        cleanup_dead_slots.stop();
+        let mut clean_dead_slots = Measure::start("reclaims::purge_slots");
+        self.clean_dead_slots(&mut dead_slots);
+        clean_dead_slots.stop();
 
         let mut purge_slots = Measure::start("reclaims::purge_slots");
         for slot in dead_slots {
@@ -981,22 +1033,25 @@ impl AccountsDB {
         accounts: &[(&Pubkey, &Account)],
         hashes: &[Hash],
     ) -> Vec<AccountInfo> {
+        let default_account = Account::default();
+
         let with_meta: Vec<(StoredMeta, &Account)> = accounts
             .iter()
             .map(|(pubkey, account)| {
                 let write_version = self.write_version.fetch_add(1, Ordering::Relaxed) as u64;
-                let data_len = if account.lamports == 0 {
-                    0
+                let account = if account.lamports == 0 {
+                    &default_account
                 } else {
-                    account.data.len() as u64
+                    *account
                 };
+                let data_len = account.data.len() as u64;
+
                 let meta = StoredMeta {
                     write_version,
                     pubkey: **pubkey,
                     data_len,
                 };
-
-                (meta, *account)
+                (meta, account)
             })
             .collect();
         let mut infos: Vec<AccountInfo> = Vec::with_capacity(with_meta.len());
@@ -1295,12 +1350,12 @@ impl AccountsDB {
         dead_slots
     }
 
-    fn cleanup_dead_slots(&self, dead_slots: &mut HashSet<Slot>) {
+    fn clean_dead_slots(&self, dead_slots: &mut HashSet<Slot>) {
         if !dead_slots.is_empty() {
             {
                 let mut index = self.accounts_index.write().unwrap();
                 for slot in dead_slots.iter() {
-                    index.cleanup_dead_slot(*slot);
+                    index.clean_dead_slot(*slot);
                 }
             }
             {
@@ -1392,35 +1447,54 @@ impl AccountsDB {
         slots.sort();
         let mut accounts_index = self.accounts_index.write().unwrap();
         for slot_id in slots.iter() {
-            let mut accumulator: Vec<HashMap<Pubkey, (u64, AccountInfo)>> = self
+            let accumulator: Vec<HashMap<Pubkey, Vec<(u64, AccountInfo)>>> = self
                 .scan_account_storage(
                     *slot_id,
                     |stored_account: &StoredAccount,
                      store_id: AppendVecId,
-                     accum: &mut HashMap<Pubkey, (u64, AccountInfo)>| {
+                     accum: &mut HashMap<Pubkey, Vec<(u64, AccountInfo)>>| {
                         let account_info = AccountInfo {
                             store_id,
                             offset: stored_account.offset,
                             lamports: stored_account.account_meta.lamports,
                         };
-                        accum.insert(
-                            stored_account.meta.pubkey,
-                            (stored_account.meta.write_version, account_info),
-                        );
+                        let entry = accum
+                            .entry(stored_account.meta.pubkey)
+                            .or_insert_with(|| vec![]);
+                        entry.push((stored_account.meta.write_version, account_info));
                     },
                 );
 
-            let mut account_maps = accumulator.pop().unwrap();
-            while let Some(maps) = accumulator.pop() {
-                AccountsDB::merge(&mut account_maps, &maps);
-            }
-            if !account_maps.is_empty() {
-                accounts_index.roots.insert(*slot_id);
-                let mut _reclaims: Vec<(u64, AccountInfo)> = vec![];
-                for (pubkey, (_, account_info)) in account_maps.iter() {
-                    accounts_index.insert(*slot_id, pubkey, account_info.clone(), &mut _reclaims);
+            let mut accounts_map: HashMap<Pubkey, Vec<(u64, AccountInfo)>> = HashMap::new();
+            for accumulator_entry in accumulator.iter() {
+                for (pubkey, storage_entry) in accumulator_entry {
+                    let entry = accounts_map.entry(*pubkey).or_insert_with(|| vec![]);
+                    entry.extend(storage_entry.iter().cloned());
                 }
             }
+
+            // Need to restore indexes even with older write versions which may
+            // be shielding other accounts. When they are then purged, the
+            // original non-shielded account value will be visible when the account
+            // is restored from the append-vec
+            if !accumulator.is_empty() {
+                let mut _reclaims: Vec<(u64, AccountInfo)> = vec![];
+                for (pubkey, account_infos) in accounts_map.iter_mut() {
+                    account_infos.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (_, account_info) in account_infos {
+                        accounts_index.insert(
+                            *slot_id,
+                            pubkey,
+                            account_info.clone(),
+                            &mut _reclaims,
+                        );
+                    }
+                }
+            }
+        }
+        // Need to add these last, otherwise older updates will be cleaned
+        for slot_id in slots {
+            accounts_index.roots.insert(slot_id);
         }
 
         let mut counts = HashMap::new();
@@ -1921,7 +1995,7 @@ pub mod tests {
         //slot is still there, since gc is lazy
         assert!(accounts.storage.read().unwrap().0[&0].get(&id).is_some());
 
-        //store causes cleanup
+        //store causes clean
         accounts.store(1, &[(&pubkey, &account)]);
 
         //slot is gone
@@ -1930,6 +2004,149 @@ pub mod tests {
         //new value is there
         let ancestors = vec![(1, 1)].into_iter().collect();
         assert_eq!(accounts.load_slow(&ancestors, &pubkey), Some((account, 1)));
+    }
+
+    impl AccountsDB {
+        fn store_count_for_slot(&self, slot: Slot) -> usize {
+            let storage = self.storage.read().unwrap();
+
+            let slot_storage = storage.0.get(&slot);
+            if let Some(slot_storage) = slot_storage {
+                slot_storage.values().nth(0).unwrap().count()
+            } else {
+                0
+            }
+        }
+
+        fn uncleaned_root_count(&self) -> usize {
+            self.accounts_index.read().unwrap().uncleaned_roots.len()
+        }
+    }
+
+    #[test]
+    fn test_clean_old_with_normal_account() {
+        solana_logger::setup();
+
+        let accounts = AccountsDB::new(Vec::new());
+        let pubkey = Pubkey::new_rand();
+        let account = Account::new(1, 0, &Account::default().owner);
+        //store an account
+        accounts.store(0, &[(&pubkey, &account)]);
+        accounts.store(1, &[(&pubkey, &account)]);
+
+        // simulate slots are rooted after while
+        accounts.add_root(0);
+        accounts.add_root(1);
+
+        //even if rooted, old state isn't cleaned up
+        assert_eq!(accounts.store_count_for_slot(0), 1);
+        assert_eq!(accounts.store_count_for_slot(1), 1);
+
+        accounts.clean_accounts();
+
+        //now old state is cleaned up
+        assert_eq!(accounts.store_count_for_slot(0), 0);
+        assert_eq!(accounts.store_count_for_slot(1), 1);
+    }
+
+    #[test]
+    fn test_clean_old_with_zero_lamport_account() {
+        solana_logger::setup();
+
+        let accounts = AccountsDB::new(Vec::new());
+        let pubkey1 = Pubkey::new_rand();
+        let pubkey2 = Pubkey::new_rand();
+        let normal_account = Account::new(1, 0, &Account::default().owner);
+        let zero_account = Account::new(0, 0, &Account::default().owner);
+        //store an account
+        accounts.store(0, &[(&pubkey1, &normal_account)]);
+        accounts.store(1, &[(&pubkey1, &zero_account)]);
+        accounts.store(0, &[(&pubkey2, &normal_account)]);
+        accounts.store(1, &[(&pubkey2, &normal_account)]);
+
+        //simulate slots are rooted after while
+        accounts.add_root(0);
+        accounts.add_root(1);
+
+        //even if rooted, old state isn't cleaned up
+        assert_eq!(accounts.store_count_for_slot(0), 2);
+        assert_eq!(accounts.store_count_for_slot(1), 2);
+
+        accounts.clean_accounts();
+
+        //still old state behind zero-lamport account isn't cleaned up
+        assert_eq!(accounts.store_count_for_slot(0), 1);
+        assert_eq!(accounts.store_count_for_slot(1), 2);
+    }
+
+    #[test]
+    fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
+        solana_logger::setup();
+
+        let accounts = AccountsDB::new(Vec::new());
+        let pubkey1 = Pubkey::new_rand();
+        let pubkey2 = Pubkey::new_rand();
+        let normal_account = Account::new(1, 0, &Account::default().owner);
+        let zero_account = Account::new(0, 0, &Account::default().owner);
+        //store an account
+        accounts.store(0, &[(&pubkey1, &normal_account)]);
+        accounts.store(1, &[(&pubkey1, &zero_account)]);
+        accounts.store(0, &[(&pubkey2, &normal_account)]);
+        accounts.store(2, &[(&pubkey2, &normal_account)]);
+
+        //simulate slots are rooted after while
+        accounts.add_root(0);
+        accounts.add_root(1);
+        accounts.add_root(2);
+
+        //even if rooted, old state isn't cleaned up
+        assert_eq!(accounts.store_count_for_slot(0), 2);
+        assert_eq!(accounts.store_count_for_slot(1), 1);
+        assert_eq!(accounts.store_count_for_slot(2), 1);
+
+        accounts.clean_accounts();
+
+        //both zero lamport and normal accounts are cleaned up
+        assert_eq!(accounts.store_count_for_slot(0), 0);
+        assert_eq!(accounts.store_count_for_slot(1), 0);
+        assert_eq!(accounts.store_count_for_slot(2), 1);
+    }
+
+    #[test]
+    fn test_uncleaned_roots_with_account() {
+        solana_logger::setup();
+
+        let accounts = AccountsDB::new(Vec::new());
+        let pubkey = Pubkey::new_rand();
+        let account = Account::new(1, 0, &Account::default().owner);
+        //store an account
+        accounts.store(0, &[(&pubkey, &account)]);
+        assert_eq!(accounts.uncleaned_root_count(), 0);
+
+        // simulate slots are rooted after while
+        accounts.add_root(0);
+        assert_eq!(accounts.uncleaned_root_count(), 1);
+
+        //now uncleaned roots are cleaned up
+        accounts.clean_accounts();
+        assert_eq!(accounts.uncleaned_root_count(), 0);
+    }
+
+    #[test]
+    fn test_uncleaned_roots_with_no_account() {
+        solana_logger::setup();
+
+        let accounts = AccountsDB::new(Vec::new());
+
+        assert_eq!(accounts.uncleaned_root_count(), 0);
+
+        // simulate slots are rooted after while
+        accounts.add_root(0);
+        assert_eq!(accounts.uncleaned_root_count(), 1);
+
+        //now uncleaned roots are cleaned up
+        accounts.clean_accounts();
+        assert_eq!(accounts.uncleaned_root_count(), 0);
     }
 
     fn print_accounts(label: &'static str, accounts: &AccountsDB) {
@@ -2049,8 +2266,8 @@ pub mod tests {
         // Don't check the first 35 accounts which have not been modified on slot 0
         check_accounts(&daccounts, &pubkeys[35..], 0, 65, 37);
         check_accounts(&daccounts, &pubkeys1, 1, 10, 1);
-        assert!(check_storage(&daccounts, 0, 78));
-        assert!(check_storage(&daccounts, 1, 11));
+        assert!(check_storage(&daccounts, 0, 100));
+        assert!(check_storage(&daccounts, 1, 21));
         assert!(check_storage(&daccounts, 2, 31));
 
         let ancestors = linear_ancestors(latest_slot);
@@ -2094,12 +2311,6 @@ pub mod tests {
         print_count_and_status("daccounts", &daccounts);
 
         daccounts
-    }
-
-    fn purge_zero_lamport_accounts(accounts: &AccountsDB, slot: Slot) {
-        let ancestors = vec![(slot as Slot, 0)].into_iter().collect();
-        info!("ancestors: {:?}", ancestors);
-        accounts.purge_zero_lamport_accounts(&ancestors);
     }
 
     fn assert_no_stores(accounts: &AccountsDB, slot: Slot) {
@@ -2146,7 +2357,7 @@ pub mod tests {
 
         print_accounts("pre_purge", &accounts);
 
-        purge_zero_lamport_accounts(&accounts, current_slot);
+        accounts.clean_accounts();
 
         print_accounts("post_purge", &accounts);
 
@@ -2209,7 +2420,7 @@ pub mod tests {
         info!("ancestors: {:?}", ancestors);
         let hash = accounts.update_accounts_hash(current_slot, &ancestors);
 
-        purge_zero_lamport_accounts(&accounts, current_slot);
+        accounts.clean_accounts();
 
         assert_eq!(
             accounts.update_accounts_hash(current_slot, &ancestors),
@@ -2280,7 +2491,7 @@ pub mod tests {
 
         print_accounts("accounts", &accounts);
 
-        purge_zero_lamport_accounts(&accounts, current_slot);
+        accounts.clean_accounts();
 
         print_accounts("accounts_post_purge", &accounts);
         let accounts = reconstruct_accounts_db_via_serialization(&accounts, current_slot);
@@ -2290,10 +2501,10 @@ pub mod tests {
         assert_load_account(&accounts, current_slot, pubkey, zero_lamport);
     }
 
-    #[test]
-    fn test_accounts_purge_chained() {
-        solana_logger::setup();
-
+    fn with_chained_zero_lamport_accounts<F>(f: F)
+    where
+        F: Fn(AccountsDB, Slot) -> AccountsDB,
+    {
         let some_lamport = 223;
         let zero_lamport = 0;
         let dummy_lamport = 999;
@@ -2332,13 +2543,41 @@ pub mod tests {
         accounts.store(current_slot, &[(&dummy_pubkey, &dummy_account)]);
         accounts.add_root(current_slot);
 
-        purge_zero_lamport_accounts(&accounts, current_slot);
-        let accounts = reconstruct_accounts_db_via_serialization(&accounts, current_slot);
+        print_accounts("pre_f", &accounts);
+        accounts.update_accounts_hash(4, &HashMap::default());
+
+        let accounts = f(accounts, current_slot);
+
+        print_accounts("post_f", &accounts);
+
+        accounts.verify_bank_hash(4, &HashMap::default()).unwrap();
 
         assert_load_account(&accounts, current_slot, pubkey, some_lamport);
         assert_load_account(&accounts, current_slot, purged_pubkey1, 0);
         assert_load_account(&accounts, current_slot, purged_pubkey2, 0);
         assert_load_account(&accounts, current_slot, dummy_pubkey, dummy_lamport);
+    }
+
+    #[test]
+    fn test_accounts_purge_chained_purge_before_snapshot_restore() {
+        solana_logger::setup();
+        with_chained_zero_lamport_accounts(|accounts, current_slot| {
+            accounts.clean_accounts();
+            let accounts = reconstruct_accounts_db_via_serialization(&accounts, current_slot);
+            accounts
+        });
+    }
+
+    #[test]
+    fn test_accounts_purge_chained_purge_after_snapshot_restore() {
+        solana_logger::setup();
+        with_chained_zero_lamport_accounts(|accounts, current_slot| {
+            let accounts = reconstruct_accounts_db_via_serialization(&accounts, current_slot);
+            print_accounts("after_reconstruct", &accounts);
+            accounts.clean_accounts();
+            let accounts = reconstruct_accounts_db_via_serialization(&accounts, current_slot);
+            accounts
+        });
     }
 
     #[test]
@@ -2723,5 +2962,68 @@ pub mod tests {
         let storage_entry = storage.0[&0].values().next().unwrap();
         storage_entry.remove_account();
         storage_entry.remove_account();
+    }
+
+    #[test]
+    fn test_accounts_purge_chained_purge_after_snapshot_restore_complex() {
+        solana_logger::setup();
+        let old_lamport = 223;
+        let latest_lamport = 777;
+        let zero_lamport = 0;
+        let no_data = 0;
+        let owner = Account::default().owner;
+
+        let account = Account::new(old_lamport, no_data, &owner);
+        let account2 = Account::new(old_lamport + 100_001, no_data, &owner);
+        let account3 = Account::new(old_lamport + 100_002, no_data, &owner);
+        let dummy_account = Account::new(99999999, no_data, &owner);
+        let latest_account = Account::new(latest_lamport, no_data, &owner);
+        let zero_lamport_account = Account::new(zero_lamport, no_data, &owner);
+
+        let pubkey = Pubkey::new_rand();
+        let zero_lamport_pubkey = Pubkey::new_rand();
+        let dummy_pubkey = Pubkey::new_rand();
+        let purged_pubkey1 = Pubkey::new_rand();
+        let purged_pubkey2 = Pubkey::new_rand();
+
+        let mut current_slot = 0;
+        let accounts = AccountsDB::new_single();
+
+        current_slot += 1;
+        accounts.store(current_slot, &[(&pubkey, &account)]);
+        accounts.store(
+            current_slot,
+            &[(&zero_lamport_pubkey, &zero_lamport_account)],
+        );
+        accounts.store(current_slot, &[(&purged_pubkey1, &account2)]);
+        accounts.add_root(current_slot);
+
+        current_slot += 1;
+        accounts.store(current_slot, &[(&purged_pubkey1, &zero_lamport_account)]);
+        accounts.store(current_slot, &[(&purged_pubkey2, &account3)]);
+        accounts.add_root(current_slot);
+
+        current_slot += 1;
+        accounts.store(current_slot, &[(&purged_pubkey2, &zero_lamport_account)]);
+        accounts.add_root(current_slot);
+
+        current_slot += 1;
+        accounts.store(current_slot, &[(&pubkey, &latest_account)]);
+        accounts.store(current_slot, &[(&dummy_pubkey, &dummy_account)]);
+        accounts.add_root(current_slot);
+
+        current_slot += 1;
+        accounts.store(current_slot, &[(&pubkey, &latest_account)]);
+        accounts.add_root(current_slot);
+
+        print_count_and_status("before reconstruct", &accounts);
+        let accounts = reconstruct_accounts_db_via_serialization(&accounts, current_slot);
+        print_count_and_status("before purge zero", &accounts);
+        accounts.clean_accounts();
+        print_count_and_status("after purge zero", &accounts);
+
+        assert_load_account(&accounts, current_slot, pubkey, latest_lamport);
+        assert_load_account(&accounts, current_slot, purged_pubkey1, 0);
+        assert_load_account(&accounts, current_slot, purged_pubkey2, 0);
     }
 }

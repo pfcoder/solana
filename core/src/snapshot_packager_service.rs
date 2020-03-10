@@ -1,7 +1,6 @@
-use crate::cluster_info::ClusterInfo;
-use solana_ledger::{
-    snapshot_package::SnapshotPackageReceiver, snapshot_utils::archive_snapshot_package,
-};
+use crate::cluster_info::{ClusterInfo, MAX_SNAPSHOT_HASHES};
+use solana_ledger::{snapshot_package::SnapshotPackageReceiver, snapshot_utils};
+use solana_sdk::{clock::Slot, hash::Hash};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -16,20 +15,27 @@ pub struct SnapshotPackagerService {
     t_snapshot_packager: JoinHandle<()>,
 }
 
-const MAX_SNAPSHOT_HASHES: usize = 24;
-
 impl SnapshotPackagerService {
     pub fn new(
         snapshot_package_receiver: SnapshotPackageReceiver,
+        starting_snapshot_hash: Option<(Slot, Hash)>,
         exit: &Arc<AtomicBool>,
         cluster_info: &Arc<RwLock<ClusterInfo>>,
     ) -> Self {
         let exit = exit.clone();
         let cluster_info = cluster_info.clone();
+
         let t_snapshot_packager = Builder::new()
             .name("solana-snapshot-packager".to_string())
             .spawn(move || {
                 let mut hashes = vec![];
+                if let Some(starting_snapshot_hash) = starting_snapshot_hash {
+                    hashes.push(starting_snapshot_hash);
+                }
+                cluster_info
+                    .write()
+                    .unwrap()
+                    .push_snapshot_hashes(hashes.clone());
                 loop {
                     if exit.load(Ordering::Relaxed) {
                         break;
@@ -37,24 +43,26 @@ impl SnapshotPackagerService {
 
                     match snapshot_package_receiver.recv_timeout(Duration::from_secs(1)) {
                         Ok(mut snapshot_package) => {
-                            hashes.push((snapshot_package.root, snapshot_package.hash));
                             // Only package the latest
                             while let Ok(new_snapshot_package) =
                                 snapshot_package_receiver.try_recv()
                             {
                                 snapshot_package = new_snapshot_package;
-                                hashes.push((snapshot_package.root, snapshot_package.hash));
                             }
-                            if let Err(err) = archive_snapshot_package(&snapshot_package) {
+                            if let Err(err) =
+                                snapshot_utils::archive_snapshot_package(&snapshot_package)
+                            {
                                 warn!("Failed to create snapshot archive: {}", err);
+                            } else {
+                                hashes.push((snapshot_package.root, snapshot_package.hash));
+                                while hashes.len() > MAX_SNAPSHOT_HASHES {
+                                    hashes.remove(0);
+                                }
+                                cluster_info
+                                    .write()
+                                    .unwrap()
+                                    .push_snapshot_hashes(hashes.clone());
                             }
-                            while hashes.len() > MAX_SNAPSHOT_HASHES {
-                                hashes.remove(0);
-                            }
-                            cluster_info
-                                .write()
-                                .unwrap()
-                                .push_snapshot_hashes(hashes.clone());
                         }
                         Err(RecvTimeoutError::Disconnected) => break,
                         Err(RecvTimeoutError::Timeout) => (),

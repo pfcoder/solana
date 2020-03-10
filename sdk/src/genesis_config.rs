@@ -4,7 +4,7 @@ use crate::{
     account::Account,
     clock::{UnixTimestamp, DEFAULT_SLOTS_PER_SEGMENT, DEFAULT_TICKS_PER_SLOT},
     epoch_schedule::EpochSchedule,
-    fee_calculator::FeeCalculator,
+    fee_calculator::FeeRateGovernor,
     hash::{hash, Hash},
     inflation::Inflation,
     native_token::lamports_to_sol,
@@ -48,8 +48,11 @@ pub struct GenesisConfig {
     pub slots_per_segment: u64,
     /// network speed configuration
     pub poh_config: PohConfig,
+    /// this field exists only to ensure that the binary layout of GenesisConfig remains compatible
+    /// with the Solana v0.23 release line
+    pub __backwards_compat_with_v0_23: u64,
     /// transaction fee config
-    pub fee_calculator: FeeCalculator,
+    pub fee_rate_governor: FeeRateGovernor,
     /// rent config
     pub rent: Rent,
     /// inflation config
@@ -89,7 +92,8 @@ impl Default for GenesisConfig {
             slots_per_segment: DEFAULT_SLOTS_PER_SEGMENT,
             poh_config: PohConfig::default(),
             inflation: Inflation::default(),
-            fee_calculator: FeeCalculator::default(),
+            __backwards_compat_with_v0_23: 0,
+            fee_rate_governor: FeeRateGovernor::default(),
             rent: Rent::default(),
             epoch_schedule: EpochSchedule::default(),
             operating_mode: OperatingMode::Development,
@@ -182,17 +186,17 @@ impl fmt::Display for GenesisConfig {
         write!(
             f,
             "\
-         Creation time: {}\n\
-         Operating mode: {:?}\n\
-         Genesis hash: {}\n\
-         Shred version: {}\n\
-         Hashes per tick: {:?}\n\
-         Slots per epoch: {}\n\
-         Warmup epochs: {}abled\n\
-         {:?}\n\
-         {:?}\n\
-         Capitalization: {} SOL in {} accounts\n\
-         ",
+             Creation time: {}\n\
+             Operating mode: {:?}\n\
+             Genesis hash: {}\n\
+             Shred version: {}\n\
+             Hashes per tick: {:?}\n\
+             Slots per epoch: {}\n\
+             Warmup epochs: {}abled\n\
+             {:?}\n\
+             {:?}\n\
+             Capitalization: {} SOL in {} accounts\n\
+             ",
             Utc.timestamp(self.creation_time, 0).to_rfc3339(),
             self.operating_mode,
             self.hash(),
@@ -205,7 +209,7 @@ impl fmt::Display for GenesisConfig {
                 "dis"
             },
             self.rent,
-            self.fee_calculator,
+            self.fee_rate_governor,
             lamports_to_sol(
                 self.accounts
                     .iter()

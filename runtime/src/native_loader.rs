@@ -7,8 +7,11 @@ use libloading::os::windows::*;
 use log::*;
 use num_derive::{FromPrimitive, ToPrimitive};
 use solana_sdk::{
-    account::KeyedAccount, entrypoint_native, instruction::InstructionError,
-    program_utils::DecodeError, pubkey::Pubkey,
+    account::KeyedAccount,
+    entrypoint_native,
+    instruction::InstructionError,
+    program_utils::{next_keyed_account, DecodeError},
+    pubkey::Pubkey,
 };
 use std::{env, path::PathBuf, str};
 use thiserror::Error;
@@ -80,17 +83,18 @@ fn library_open(path: &PathBuf) -> std::io::Result<Library> {
 }
 
 pub fn invoke_entrypoint(
-    program_id: &Pubkey,
+    _program_id: &Pubkey,
     keyed_accounts: &[KeyedAccount],
     instruction_data: &[u8],
     symbol_cache: &SymbolCache,
 ) -> Result<(), InstructionError> {
-    // dispatch it
-    let (names, params) = keyed_accounts.split_at(1);
-    let name_vec = &names[0].try_account_ref()?.data;
+    let mut keyed_accounts_iter = keyed_accounts.iter();
+    let program = next_keyed_account(&mut keyed_accounts_iter)?;
+    let params = keyed_accounts_iter.as_slice();
+    let name_vec = &program.try_account_ref()?.data;
     if let Some(entrypoint) = symbol_cache.read().unwrap().get(name_vec) {
         unsafe {
-            return entrypoint(program_id, params, instruction_data);
+            return entrypoint(program.unsigned_key(), params, instruction_data);
         }
     }
     let name = match str::from_utf8(name_vec) {
@@ -116,7 +120,7 @@ pub fn invoke_entrypoint(
                         return Err(NativeLoaderError::EntrypointNotFound.into());
                     }
                 };
-            let ret = entrypoint(program_id, params, instruction_data);
+            let ret = entrypoint(program.unsigned_key(), params, instruction_data);
             symbol_cache
                 .write()
                 .unwrap()

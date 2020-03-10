@@ -3,6 +3,7 @@
 use crate::{
     broadcast_stage::BroadcastStageType,
     cluster_info::{ClusterInfo, Node},
+    cluster_info_vote_listener::VoteTracker,
     commitment::BlockCommitmentCache,
     contact_info::ContactInfo,
     gossip_service::{discover_cluster, GossipService},
@@ -16,6 +17,7 @@ use crate::{
     serve_repair::ServeRepair,
     serve_repair_service::ServeRepairService,
     sigverify,
+    snapshot_packager_service::SnapshotPackagerService,
     storage_stage::StorageState,
     tpu::Tpu,
     transaction_status_service::TransactionStatusService,
@@ -50,7 +52,7 @@ use std::{
     process,
     sync::atomic::{AtomicBool, Ordering},
     sync::mpsc::Receiver,
-    sync::{Arc, Mutex, RwLock},
+    sync::{mpsc::channel, Arc, Mutex, RwLock},
     thread::{sleep, Result},
     time::Duration,
 };
@@ -72,7 +74,7 @@ pub struct ValidatorConfig {
     pub broadcast_stage_type: BroadcastStageType,
     pub enable_partition: Option<Arc<AtomicBool>>,
     pub fixed_leader_schedule: Option<FixedSchedule>,
-    pub wait_for_supermajority: bool,
+    pub wait_for_supermajority: Option<Slot>,
     pub new_hard_forks: Option<Vec<Slot>>,
     pub trusted_validators: Option<HashSet<Pubkey>>, // None = trust all
 }
@@ -95,7 +97,7 @@ impl Default for ValidatorConfig {
             broadcast_stage_type: BroadcastStageType::Standard,
             enable_partition: None,
             fixed_leader_schedule: None,
-            wait_for_supermajority: false,
+            wait_for_supermajority: None,
             new_hard_forks: None,
             trusted_validators: None,
         }
@@ -127,6 +129,7 @@ pub struct Validator {
     rewards_recorder_service: Option<RewardsRecorderService>,
     gossip_service: GossipService,
     serve_repair_service: ServeRepairService,
+    snapshot_packager_service: Option<SnapshotPackagerService>,
     poh_recorder: Arc<Mutex<PohRecorder>>,
     poh_service: PohService,
     tpu: Tpu,
@@ -237,6 +240,7 @@ impl Validator {
                 JsonRpcService::new(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), rpc_port),
                     config.rpc_config.clone(),
+                    config.snapshot_config.clone(),
                     bank_forks.clone(),
                     block_commitment_cache.clone(),
                     blockstore.clone(),
@@ -349,39 +353,16 @@ impl Validator {
                 .set_entrypoint(entrypoint_info.clone());
         }
 
-        if let Some(snapshot_hash) = snapshot_hash {
-            if let Some(ref trusted_validators) = config.trusted_validators {
-                let mut trusted = false;
-                for _ in 0..10 {
-                    trusted = cluster_info
-                        .read()
-                        .unwrap()
-                        .get_snapshot_hash(snapshot_hash.0)
-                        .iter()
-                        .any(|(pubkey, hash)| {
-                            trusted_validators.contains(pubkey) && snapshot_hash.1 == *hash
-                        });
-                    if trusted {
-                        break;
-                    }
-                    sleep(Duration::from_secs(1));
-                }
-
-                if !trusted {
-                    error!(
-                        "The snapshot hash for slot {} is not published by your trusted validators: {:?}",
-                        snapshot_hash.0, trusted_validators
-                    );
-                    process::exit(1);
-                }
-            }
-
-            // If the node was loaded from a snapshot, advertise it in gossip
-            cluster_info
-                .write()
-                .unwrap()
-                .push_snapshot_hashes(vec![snapshot_hash]);
-        }
+        let (snapshot_packager_service, snapshot_package_sender) =
+            if config.snapshot_config.is_some() {
+                // Start a snapshot packaging service
+                let (sender, receiver) = channel();
+                let snapshot_packager_service =
+                    SnapshotPackagerService::new(receiver, snapshot_hash, &exit, &cluster_info);
+                (Some(snapshot_packager_service), Some(sender))
+            } else {
+                (None, None)
+            };
 
         wait_for_supermajority(config, &bank, &cluster_info);
 
@@ -397,6 +378,8 @@ impl Validator {
             1,
             "New shred signal for the TVU should be the same as the clear bank signal."
         );
+
+        let vote_tracker = Arc::new({ VoteTracker::new(bank_forks.read().unwrap().root_bank()) });
 
         let tvu = Tvu::new(
             vote_account,
@@ -445,6 +428,8 @@ impl Validator {
             node.info.shred_version,
             transaction_status_sender.clone(),
             rewards_recorder_sender,
+            snapshot_package_sender,
+            vote_tracker.clone(),
         );
 
         if config.dev_sigverify_disabled {
@@ -464,6 +449,8 @@ impl Validator {
             &config.broadcast_stage_type,
             &exit,
             node.info.shred_version,
+            vote_tracker,
+            bank_forks,
         );
 
         datapoint_info!("validator-new", ("id", id.to_string(), String));
@@ -474,6 +461,7 @@ impl Validator {
             rpc_service,
             transaction_status_service,
             rewards_recorder_service,
+            snapshot_packager_service,
             tpu,
             tvu,
             poh_service,
@@ -533,6 +521,10 @@ impl Validator {
 
         if let Some(rewards_recorder_service) = self.rewards_recorder_service {
             rewards_recorder_service.join()?;
+        }
+
+        if let Some(s) = self.snapshot_packager_service {
+            s.join()?;
         }
 
         self.gossip_service.join()?;
@@ -630,19 +622,19 @@ fn wait_for_supermajority(
     bank: &Arc<Bank>,
     cluster_info: &Arc<RwLock<ClusterInfo>>,
 ) {
-    if !config.wait_for_supermajority {
+    if config.wait_for_supermajority != Some(bank.slot()) {
         return;
     }
 
     info!(
-        "Waiting for more than 75% of activated stake at slot {} to be in gossip...",
+        "Waiting for 80% of activated stake at slot {} to be in gossip...",
         bank.slot()
     );
     loop {
         let gossip_stake_percent = get_stake_percent_in_gossip(&bank, &cluster_info);
 
         info!("{}% of activated stake in gossip", gossip_stake_percent,);
-        if gossip_stake_percent > 75 {
+        if gossip_stake_percent >= 80 {
             break;
         }
         sleep(Duration::new(1, 0));
@@ -680,7 +672,7 @@ impl TestValidator {
 
     pub fn run_with_options(options: TestValidatorOptions) -> Self {
         use crate::genesis_utils::{create_genesis_config_with_leader_ex, GenesisConfigInfo};
-        use solana_sdk::fee_calculator::FeeCalculator;
+        use solana_sdk::fee_calculator::FeeRateGovernor;
 
         let TestValidatorOptions {
             fees,
@@ -706,7 +698,7 @@ impl TestValidator {
 
         genesis_config.rent.lamports_per_byte_year = 1;
         genesis_config.rent.exemption_threshold = 1.0;
-        genesis_config.fee_calculator = FeeCalculator::new(fees, 0);
+        genesis_config.fee_rate_governor = FeeRateGovernor::new(fees, 0);
 
         let (ledger_path, blockhash) = create_new_tmp_ledger!(&genesis_config);
 
@@ -749,16 +741,19 @@ fn report_target_features() {
         }
     );
 
-    // Validator binaries built on a machine with AVX support will generate invalid opcodes
-    // when run on machines without AVX causing a non-obvious process abort.  Instead detect
-    // the mismatch and error cleanly.
-    #[target_feature(enable = "avx")]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("avx") {
-            info!("AVX detected");
-        } else {
-            error!("Your machine does not have AVX support, please rebuild from source on your machine");
-            process::exit(1);
+        // Validator binaries built on a machine with AVX support will generate invalid opcodes
+        // when run on machines without AVX causing a non-obvious process abort.  Instead detect
+        // the mismatch and error cleanly.
+        #[target_feature(enable = "avx")]
+        {
+            if is_x86_feature_detected!("avx") {
+                info!("AVX detected");
+            } else {
+                error!("Your machine does not have AVX support, please rebuild from source on your machine");
+                process::exit(1);
+            }
         }
     }
 }

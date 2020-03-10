@@ -3,9 +3,9 @@
 #![allow(unreachable_code)]
 
 extern crate solana_sdk;
-
 use solana_sdk::{
-    account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, info, log::*, pubkey::Pubkey,
+    account_info::AccountInfo, bpf_loader, entrypoint, entrypoint::ProgramResult, info, log::*,
+    pubkey::Pubkey,
 };
 
 #[derive(Debug, PartialEq)]
@@ -28,6 +28,8 @@ fn process_instruction(
 ) -> ProgramResult {
     info!("Program identifier:");
     program_id.log();
+
+    assert!(!bpf_loader::check_id(program_id));
 
     // Log the provided account keys and instruction input data.  In the case of
     // the no-op program, no account keys or input data are expected but real
@@ -65,7 +67,7 @@ fn process_instruction(
 #[cfg(test)]
 mod test {
     use super::*;
-    // Pulls in the stubs requried for `info!()`
+    // Pulls in the stubs required for `info!()`
     solana_sdk_bpf_test::stubs!();
 
     #[test]

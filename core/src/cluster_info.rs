@@ -84,6 +84,9 @@ const MAX_GOSSIP_TRAFFIC: usize = 128_000_000 / PACKET_DATA_SIZE;
 const NUM_BITS_PER_BYTE: u64 = 8;
 const MIN_SIZE_TO_COMPRESS_GZIP: u64 = 64;
 
+/// Keep the number of snapshot hashes a node publishes under MAX_PROTOCOL_PAYLOAD_SIZE
+pub const MAX_SNAPSHOT_HASHES: usize = 16;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ClusterInfoError {
     NoPeers,
@@ -441,6 +444,14 @@ impl ClusterInfo {
     }
 
     pub fn push_snapshot_hashes(&mut self, snapshot_hashes: Vec<(Slot, Hash)>) {
+        if snapshot_hashes.len() > MAX_SNAPSHOT_HASHES {
+            warn!(
+                "snapshot_hashes too large, ignored: {}",
+                snapshot_hashes.len()
+            );
+            return;
+        }
+
         let now = timestamp();
         let entry = CrdsValue::new_signed(
             CrdsData::SnapshotHash(SnapshotHash::new(self.id(), snapshot_hashes, now)),
@@ -1059,7 +1070,7 @@ impl ClusterInfo {
     }
 
     /// Splits a Vec of CrdsValues into a nested Vec, trying to make sure that
-    /// each Vec is no larger than `PROTOCOL_PAYLOAD_SIZE`
+    /// each Vec is no larger than `MAX_PROTOCOL_PAYLOAD_SIZE`
     /// Note: some messages cannot be contained within that size so in the worst case this returns
     /// N nested Vecs with 1 item each.
     fn split_gossip_messages(msgs: Vec<CrdsValue>) -> Vec<Vec<CrdsValue>> {
@@ -1624,8 +1635,9 @@ impl ClusterInfo {
         id: &Pubkey,
         gossip_addr: &SocketAddr,
     ) -> (ContactInfo, UdpSocket, Option<TcpListener>) {
+        let bind_ip_addr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
         let (port, (gossip_socket, ip_echo)) =
-            Node::get_gossip_port(gossip_addr, VALIDATOR_PORT_RANGE);
+            Node::get_gossip_port(gossip_addr, VALIDATOR_PORT_RANGE, bind_ip_addr);
         let contact_info = Self::gossip_contact_info(id, SocketAddr::new(gossip_addr.ip(), port));
 
         (contact_info, gossip_socket, Some(ip_echo))
@@ -1633,7 +1645,8 @@ impl ClusterInfo {
 
     /// A Node with dummy ports to spy on gossip via pull requests
     pub fn spy_node(id: &Pubkey) -> (ContactInfo, UdpSocket, Option<TcpListener>) {
-        let (_, gossip_socket) = bind_in_range(VALIDATOR_PORT_RANGE).unwrap();
+        let bind_ip_addr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+        let (_, gossip_socket) = bind_in_range(bind_ip_addr, VALIDATOR_PORT_RANGE).unwrap();
         let contact_info = Self::spy_contact_info(id);
 
         (contact_info, gossip_socket, None)
@@ -1748,16 +1761,18 @@ impl Node {
         }
     }
     pub fn new_localhost_with_pubkey(pubkey: &Pubkey) -> Self {
+        let bind_ip_addr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
         let tpu = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let (gossip_port, (gossip, ip_echo)) = bind_common_in_range((1024, 65535)).unwrap();
+        let (gossip_port, (gossip, ip_echo)) =
+            bind_common_in_range(bind_ip_addr, (1024, 65535)).unwrap();
         let gossip_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), gossip_port);
         let tvu = UdpSocket::bind("127.0.0.1:0").unwrap();
         let tvu_forwards = UdpSocket::bind("127.0.0.1:0").unwrap();
         let tpu_forwards = UdpSocket::bind("127.0.0.1:0").unwrap();
         let repair = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let rpc_port = find_available_port_in_range((1024, 65535)).unwrap();
+        let rpc_port = find_available_port_in_range(bind_ip_addr, (1024, 65535)).unwrap();
         let rpc_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), rpc_port);
-        let rpc_pubsub_port = find_available_port_in_range((1024, 65535)).unwrap();
+        let rpc_pubsub_port = find_available_port_in_range(bind_ip_addr, (1024, 65535)).unwrap();
         let rpc_pubsub_addr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), rpc_pubsub_port);
 
@@ -1800,45 +1815,52 @@ impl Node {
     fn get_gossip_port(
         gossip_addr: &SocketAddr,
         port_range: PortRange,
+        bind_ip_addr: IpAddr,
     ) -> (u16, (UdpSocket, TcpListener)) {
         if gossip_addr.port() != 0 {
             (
                 gossip_addr.port(),
-                bind_common(gossip_addr.port(), false).unwrap_or_else(|e| {
+                bind_common(bind_ip_addr, gossip_addr.port(), false).unwrap_or_else(|e| {
                     panic!("gossip_addr bind_to port {}: {}", gossip_addr.port(), e)
                 }),
             )
         } else {
-            bind_common_in_range(port_range).expect("Failed to bind")
+            bind_common_in_range(bind_ip_addr, port_range).expect("Failed to bind")
         }
     }
-    fn bind(port_range: PortRange) -> (u16, UdpSocket) {
-        bind_in_range(port_range).expect("Failed to bind")
+    fn bind(bind_ip_addr: IpAddr, port_range: PortRange) -> (u16, UdpSocket) {
+        bind_in_range(bind_ip_addr, port_range).expect("Failed to bind")
     }
+
     pub fn new_with_external_ip(
         pubkey: &Pubkey,
         gossip_addr: &SocketAddr,
         port_range: PortRange,
+        bind_ip_addr: IpAddr,
     ) -> Node {
-        let (gossip_port, (gossip, ip_echo)) = Self::get_gossip_port(gossip_addr, port_range);
+        let (gossip_port, (gossip, ip_echo)) =
+            Self::get_gossip_port(gossip_addr, port_range, bind_ip_addr);
 
-        let (tvu_port, tvu_sockets) = multi_bind_in_range(port_range, 8).expect("tvu multi_bind");
+        let (tvu_port, tvu_sockets) =
+            multi_bind_in_range(bind_ip_addr, port_range, 8).expect("tvu multi_bind");
 
         let (tvu_forwards_port, tvu_forwards_sockets) =
-            multi_bind_in_range(port_range, 8).expect("tvu_forwards multi_bind");
+            multi_bind_in_range(bind_ip_addr, port_range, 8).expect("tvu_forwards multi_bind");
 
-        let (tpu_port, tpu_sockets) = multi_bind_in_range(port_range, 32).expect("tpu multi_bind");
+        let (tpu_port, tpu_sockets) =
+            multi_bind_in_range(bind_ip_addr, port_range, 32).expect("tpu multi_bind");
 
         let (tpu_forwards_port, tpu_forwards_sockets) =
-            multi_bind_in_range(port_range, 8).expect("tpu_forwards multi_bind");
+            multi_bind_in_range(bind_ip_addr, port_range, 8).expect("tpu_forwards multi_bind");
 
         let (_, retransmit_sockets) =
-            multi_bind_in_range(port_range, 8).expect("retransmit multi_bind");
+            multi_bind_in_range(bind_ip_addr, port_range, 8).expect("retransmit multi_bind");
 
-        let (repair_port, repair) = Self::bind(port_range);
-        let (serve_repair_port, serve_repair) = Self::bind(port_range);
+        let (repair_port, repair) = Self::bind(bind_ip_addr, port_range);
+        let (serve_repair_port, serve_repair) = Self::bind(bind_ip_addr, port_range);
 
-        let (_, broadcast) = multi_bind_in_range(port_range, 4).expect("broadcast multi_bind");
+        let (_, broadcast) =
+            multi_bind_in_range(bind_ip_addr, port_range, 4).expect("broadcast multi_bind");
 
         let info = ContactInfo {
             id: *pubkey,
@@ -1878,9 +1900,10 @@ impl Node {
         pubkey: &Pubkey,
         gossip_addr: &SocketAddr,
         port_range: PortRange,
+        bind_ip_addr: IpAddr,
     ) -> Node {
-        let mut new = Self::new_with_external_ip(pubkey, gossip_addr, port_range);
-        let (storage_port, storage_socket) = Self::bind(port_range);
+        let mut new = Self::new_with_external_ip(pubkey, gossip_addr, port_range, bind_ip_addr);
+        let (storage_port, storage_socket) = Self::bind(bind_ip_addr, port_range);
 
         new.info.storage_addr = SocketAddr::new(gossip_addr.ip(), storage_port);
         new.sockets.storage = Some(storage_socket);
@@ -2014,6 +2037,7 @@ mod tests {
             &Pubkey::new_rand(),
             &socketaddr!(ip, 0),
             VALIDATOR_PORT_RANGE,
+            IpAddr::V4(ip),
         );
 
         check_node_sockets(&node, IpAddr::V4(ip), VALIDATOR_PORT_RANGE);
@@ -2023,7 +2047,7 @@ mod tests {
     fn new_with_external_ip_test_gossip() {
         let ip = IpAddr::V4(Ipv4Addr::from(0));
         let port = {
-            bind_in_range(VALIDATOR_PORT_RANGE)
+            bind_in_range(ip, VALIDATOR_PORT_RANGE)
                 .expect("Failed to bind")
                 .0
         };
@@ -2031,6 +2055,7 @@ mod tests {
             &Pubkey::new_rand(),
             &socketaddr!(0, port),
             VALIDATOR_PORT_RANGE,
+            ip,
         );
 
         check_node_sockets(&node, ip, VALIDATOR_PORT_RANGE);
@@ -2045,6 +2070,7 @@ mod tests {
             &Pubkey::new_rand(),
             &socketaddr!(ip, 0),
             VALIDATOR_PORT_RANGE,
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
         );
 
         let ip = IpAddr::V4(ip);

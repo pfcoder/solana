@@ -10,6 +10,18 @@ written to disk by unencrypted memory swaps. It is the user's responsibility to
 protect against this scenario.
 {% endhint %}
 
+## Before You Begin
+
+- [Install the Solana command-line tools](../install-solana.md)
+
+### Check your installation
+
+Check that `solana-keygen` is installed correctly by running:
+
+```bash
+solana-keygen --version
+```
+
 ## Creating a Paper Wallet
 
 Using the `solana-keygen` tool, it is possible to generate new seed phrases as
@@ -113,7 +125,7 @@ Command
 
 ```text
 solana transfer 11111111111111111111111111111111 0 --sign-only \
-    --ask-seed-phrase keypair --blockhash 11111111111111111111111111111111
+    --keypair ASK --blockhash 11111111111111111111111111111111
 ```
 
 Prompt for seed phrase
@@ -221,21 +233,20 @@ done < public_keys.txt
 
 In order to run a validator, you will need to specify an "identity keypair"
 which will be used to fund all of the vote transactions signed by your validator.
-Rather than specifying a path with `--identity-keypair <PATH>` you can use the
-`--ask-seed-phrase` option.
+Rather than specifying a path with `--identity-keypair <PATH>` you can pass
+`ASK` to securely input the funding keypair.
 
 ```bash
-solana-validator --ask-seed-phrase identity-keypair --ledger ...
+solana-validator --identity-keypair ASK --ledger ...
 
 [identity-keypair] seed phrase: 🔒
 [identity-keypair] If this seed phrase has an associated passphrase, enter it now. Otherwise, press ENTER to continue:
 ```
 
-The `--ask-seed-phrase` option accepts multiple keypairs. If you wish to use this
-input method for your voting keypair as well you can do the following:
+You can use this input method for your voting keypair as well:
 
 ```bash
-solana-validator --ask-seed-phrase identity-keypair voting-keypair --ledger ...
+solana-validator --identity-keypair ASK --voting-keypair ASK --ledger ...
 
 [identity-keypair] seed phrase: 🔒
 [identity-keypair] If this seed phrase has an associated passphrase, enter it now. Otherwise, press ENTER to continue:

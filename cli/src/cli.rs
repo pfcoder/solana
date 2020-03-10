@@ -23,7 +23,7 @@ use solana_client::{client_error::ClientError, rpc_client::RpcClient};
 use solana_faucet::faucet::request_airdrop_transaction;
 #[cfg(test)]
 use solana_faucet::faucet_mock::request_airdrop_transaction;
-use solana_remote_wallet::remote_wallet::{DerivationPath, RemoteWalletManager};
+use solana_remote_wallet::remote_wallet::RemoteWalletManager;
 use solana_sdk::{
     bpf_loader,
     clock::{Epoch, Slot},
@@ -40,7 +40,10 @@ use solana_sdk::{
     system_instruction::{self, create_address_with_seed, SystemError, MAX_ADDRESS_SEED_LEN},
     transaction::{Transaction, TransactionError},
 };
-use solana_stake_program::stake_state::{Lockup, StakeAuthorize};
+use solana_stake_program::{
+    stake_instruction::LockupArgs,
+    stake_state::{Lockup, StakeAuthorize},
+};
 use solana_storage_program::storage_instruction::StorageAccountType;
 use solana_vote_program::vote_state::VoteAuthorize;
 use std::{
@@ -52,6 +55,7 @@ use std::{
     time::Duration,
     {error, fmt},
 };
+use url::Url;
 
 pub type CliSigners = Vec<Box<dyn Signer>>;
 pub type SignerIndex = usize;
@@ -163,6 +167,7 @@ pub enum CliCommand {
     // Cluster Query Commands
     Catchup {
         node_pubkey: Pubkey,
+        node_json_rpc_url: Option<String>,
     },
     ClusterVersion,
     CreateAddressWithSeed {
@@ -181,13 +186,14 @@ pub enum CliCommand {
     GetSlot {
         commitment_config: CommitmentConfig,
     },
+    TotalSupply {
+        commitment_config: CommitmentConfig,
+    },
     GetTransactionCount {
         commitment_config: CommitmentConfig,
     },
     LeaderSchedule,
-    LiveSlots {
-        url: String,
-    },
+    LiveSlots,
     Ping {
         lamports: u64,
         interval: Duration,
@@ -206,6 +212,7 @@ pub enum CliCommand {
     },
     ShowValidators {
         use_lamports_unit: bool,
+        commitment_config: CommitmentConfig,
     },
     // Nonce commands
     AuthorizeNonceAccount {
@@ -303,7 +310,7 @@ pub enum CliCommand {
     },
     StakeSetLockup {
         stake_account_pubkey: Pubkey,
-        lockup: Lockup,
+        lockup: LockupArgs,
         custodian: SignerIndex,
         sign_only: bool,
         blockhash_query: BlockhashQuery,
@@ -351,6 +358,7 @@ pub enum CliCommand {
     ShowVoteAccount {
         pubkey: Pubkey,
         use_lamports_unit: bool,
+        commitment_config: CommitmentConfig,
     },
     VoteAuthorize {
         vote_account_pubkey: Pubkey,
@@ -435,25 +443,85 @@ impl From<Box<dyn error::Error>> for CliError {
     }
 }
 
+pub enum SettingType {
+    Explicit,
+    Computed,
+    SystemDefault,
+}
+
 pub struct CliConfig<'a> {
     pub command: CliCommand,
     pub json_rpc_url: String,
+    pub websocket_url: String,
     pub signers: Vec<&'a dyn Signer>,
     pub keypair_path: String,
-    pub derivation_path: Option<DerivationPath>,
     pub rpc_client: Option<RpcClient>,
     pub verbose: bool,
 }
 
 impl CliConfig<'_> {
-    pub fn default_keypair_path() -> String {
-        let mut keypair_path = dirs::home_dir().expect("home directory");
-        keypair_path.extend(&[".config", "solana", "id.json"]);
-        keypair_path.to_str().unwrap().to_string()
+    fn default_keypair_path() -> String {
+        solana_cli_config::Config::default().keypair_path
     }
 
-    pub fn default_json_rpc_url() -> String {
-        "http://127.0.0.1:8899".to_string()
+    fn default_json_rpc_url() -> String {
+        solana_cli_config::Config::default().json_rpc_url
+    }
+
+    fn default_websocket_url() -> String {
+        solana_cli_config::Config::default().websocket_url
+    }
+
+    fn first_nonempty_setting(
+        settings: std::vec::Vec<(SettingType, String)>,
+    ) -> (SettingType, String) {
+        settings
+            .into_iter()
+            .find(|(_, value)| value != "")
+            .expect("no nonempty setting")
+    }
+
+    pub fn compute_websocket_url_setting(
+        websocket_cmd_url: &str,
+        websocket_cfg_url: &str,
+        json_rpc_cmd_url: &str,
+        json_rpc_cfg_url: &str,
+    ) -> (SettingType, String) {
+        Self::first_nonempty_setting(vec![
+            (SettingType::Explicit, websocket_cmd_url.to_string()),
+            (SettingType::Explicit, websocket_cfg_url.to_string()),
+            (
+                SettingType::Computed,
+                solana_cli_config::Config::compute_websocket_url(json_rpc_cmd_url),
+            ),
+            (
+                SettingType::Computed,
+                solana_cli_config::Config::compute_websocket_url(json_rpc_cfg_url),
+            ),
+            (SettingType::SystemDefault, Self::default_websocket_url()),
+        ])
+    }
+
+    pub fn compute_json_rpc_url_setting(
+        json_rpc_cmd_url: &str,
+        json_rpc_cfg_url: &str,
+    ) -> (SettingType, String) {
+        Self::first_nonempty_setting(vec![
+            (SettingType::Explicit, json_rpc_cmd_url.to_string()),
+            (SettingType::Explicit, json_rpc_cfg_url.to_string()),
+            (SettingType::SystemDefault, Self::default_json_rpc_url()),
+        ])
+    }
+
+    pub fn compute_keypair_path_setting(
+        keypair_cmd_path: &str,
+        keypair_cfg_path: &str,
+    ) -> (SettingType, String) {
+        Self::first_nonempty_setting(vec![
+            (SettingType::Explicit, keypair_cmd_path.to_string()),
+            (SettingType::Explicit, keypair_cfg_path.to_string()),
+            (SettingType::SystemDefault, Self::default_keypair_path()),
+        ])
     }
 
     pub(crate) fn pubkey(&self) -> Result<Pubkey, SignerError> {
@@ -475,9 +543,9 @@ impl Default for CliConfig<'_> {
                 use_lamports_unit: false,
             },
             json_rpc_url: Self::default_json_rpc_url(),
+            websocket_url: Self::default_websocket_url(),
             signers: Vec::new(),
             keypair_path: Self::default_keypair_path(),
-            derivation_path: None,
             rpc_client: None,
             verbose: false,
         }
@@ -496,7 +564,9 @@ pub fn parse_command(
             command: CliCommand::ClusterVersion,
             signers: vec![],
         }),
-        ("create-address-with-seed", Some(matches)) => parse_create_address_with_seed(matches),
+        ("create-address-with-seed", Some(matches)) => {
+            parse_create_address_with_seed(matches, default_signer_path, wallet_manager)
+        }
         ("fees", Some(_matches)) => Ok(CliCommandInfo {
             command: CliCommand::Fees,
             signers: vec![],
@@ -508,13 +578,17 @@ pub fn parse_command(
             signers: vec![],
         }),
         ("slot", Some(matches)) => parse_get_slot(matches),
+        ("total-supply", Some(matches)) => parse_total_supply(matches),
         ("transaction-count", Some(matches)) => parse_get_transaction_count(matches),
         ("leader-schedule", Some(_matches)) => Ok(CliCommandInfo {
             command: CliCommand::LeaderSchedule,
             signers: vec![],
         }),
         ("ping", Some(matches)) => parse_cluster_ping(matches, default_signer_path, wallet_manager),
-        ("live-slots", Some(matches)) => parse_live_slots(matches),
+        ("live-slots", Some(_matches)) => Ok(CliCommandInfo {
+            command: CliCommand::LiveSlots,
+            signers: vec![],
+        }),
         ("block-production", Some(matches)) => parse_show_block_production(matches),
         ("gossip", Some(_matches)) => Ok(CliCommandInfo {
             command: CliCommand::ShowGossip,
@@ -939,8 +1013,20 @@ pub fn return_signers(tx: &Transaction) -> ProcessResult {
 
 pub fn parse_create_address_with_seed(
     matches: &ArgMatches<'_>,
+    default_signer_path: &str,
+    wallet_manager: Option<&Arc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
-    let from_pubkey = pubkey_of(matches, "from");
+    let from_pubkey = pubkey_of_signer(matches, "from", wallet_manager)?;
+    let signers = if from_pubkey.is_some() {
+        vec![]
+    } else {
+        vec![signer_from_path(
+            matches,
+            default_signer_path,
+            "keypair",
+            wallet_manager,
+        )?]
+    };
 
     let program_id = match matches.value_of("program_id").unwrap() {
         "STAKE" => solana_stake_program::id(),
@@ -963,7 +1049,7 @@ pub fn parse_create_address_with_seed(
             seed,
             program_id,
         },
-        signers: vec![],
+        signers,
     })
 }
 
@@ -973,9 +1059,12 @@ fn process_create_address_with_seed(
     seed: &str,
     program_id: &Pubkey,
 ) -> ProcessResult {
-    let config_pubkey = config.pubkey()?;
-    let from_pubkey = from_pubkey.unwrap_or(&config_pubkey);
-    let address = create_address_with_seed(from_pubkey, seed, program_id)?;
+    let from_pubkey = if let Some(pubkey) = from_pubkey {
+        *pubkey
+    } else {
+        config.pubkey()?
+    };
+    let address = create_address_with_seed(&from_pubkey, seed, program_id)?;
     Ok(address.to_string())
 }
 
@@ -1454,7 +1543,10 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
         CliCommand::Address => Ok(format!("{}", config.pubkey()?)),
 
         // Return software version of solana-cli and cluster entrypoint node
-        CliCommand::Catchup { node_pubkey } => process_catchup(&rpc_client, node_pubkey),
+        CliCommand::Catchup {
+            node_pubkey,
+            node_json_rpc_url,
+        } => process_catchup(&rpc_client, node_pubkey, node_json_rpc_url),
         CliCommand::ClusterVersion => process_cluster_version(&rpc_client),
         CliCommand::CreateAddressWithSeed {
             from_pubkey,
@@ -1465,16 +1557,19 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
         CliCommand::GetBlockTime { slot } => process_get_block_time(&rpc_client, *slot),
         CliCommand::GetGenesisHash => process_get_genesis_hash(&rpc_client),
         CliCommand::GetEpochInfo { commitment_config } => {
-            process_get_epoch_info(&rpc_client, commitment_config)
+            process_get_epoch_info(&rpc_client, *commitment_config)
         }
         CliCommand::GetSlot { commitment_config } => {
-            process_get_slot(&rpc_client, commitment_config)
+            process_get_slot(&rpc_client, *commitment_config)
+        }
+        CliCommand::TotalSupply { commitment_config } => {
+            process_total_supply(&rpc_client, *commitment_config)
         }
         CliCommand::GetTransactionCount { commitment_config } => {
-            process_get_transaction_count(&rpc_client, commitment_config)
+            process_get_transaction_count(&rpc_client, *commitment_config)
         }
         CliCommand::LeaderSchedule => process_leader_schedule(&rpc_client),
-        CliCommand::LiveSlots { url } => process_live_slots(&url),
+        CliCommand::LiveSlots => process_live_slots(&config.websocket_url),
         CliCommand::Ping {
             lamports,
             interval,
@@ -1488,7 +1583,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             interval,
             count,
             timeout,
-            commitment_config,
+            *commitment_config,
         ),
         CliCommand::ShowBlockProduction { epoch, slot_limit } => {
             process_show_block_production(&rpc_client, config, *epoch, *slot_limit)
@@ -1502,9 +1597,10 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
             *use_lamports_unit,
             vote_account_pubkeys.as_deref(),
         ),
-        CliCommand::ShowValidators { use_lamports_unit } => {
-            process_show_validators(&rpc_client, *use_lamports_unit)
-        }
+        CliCommand::ShowValidators {
+            use_lamports_unit,
+            commitment_config,
+        } => process_show_validators(&rpc_client, *use_lamports_unit, *commitment_config),
 
         // Nonce Commands
 
@@ -1816,11 +1912,13 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
         CliCommand::ShowVoteAccount {
             pubkey: vote_account_pubkey,
             use_lamports_unit,
+            commitment_config,
         } => process_show_vote_account(
             &rpc_client,
             config,
             &vote_account_pubkey,
             *use_lamports_unit,
+            *commitment_config,
         ),
         CliCommand::VoteAuthorize {
             vote_account_pubkey,
@@ -1854,7 +1952,7 @@ pub fn process_command(config: &CliConfig) -> ProcessResult {
         } => {
             let faucet_addr = SocketAddr::new(
                 faucet_host.unwrap_or_else(|| {
-                    let faucet_host = url::Url::parse(&config.json_rpc_url)
+                    let faucet_host = Url::parse(&config.json_rpc_url)
                         .unwrap()
                         .host()
                         .unwrap()
@@ -2185,7 +2283,7 @@ pub fn app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> App<'ab, '
                         .value_name("PUBKEY")
                         .takes_value(true)
                         .required(false)
-                        .validator(is_pubkey_or_keypair)
+                        .validator(is_valid_signer)
                         .help("From (base) key, defaults to client keypair."),
                 ),
         )
@@ -2383,7 +2481,7 @@ mod tests {
     };
     use solana_sdk::{
         account::Account,
-        nonce_state::{Meta as NonceMeta, NonceState},
+        nonce,
         pubkey::Pubkey,
         signature::{keypair_from_seed, read_keypair_file, write_keypair_file, Presigner},
         system_program,
@@ -2618,14 +2716,14 @@ mod tests {
             "STAKE",
         ]);
         assert_eq!(
-            parse_command(&test_create_address_with_seed, "", None).unwrap(),
+            parse_command(&test_create_address_with_seed, &keypair_file, None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::CreateAddressWithSeed {
                     from_pubkey: None,
                     seed: "seed".to_string(),
                     program_id: solana_stake_program::id(),
                 },
-                signers: vec![],
+                signers: vec![read_keypair_file(&keypair_file).unwrap().into()],
             }
         );
 
@@ -3162,18 +3260,16 @@ mod tests {
 
         // Nonced pay
         let blockhash = Hash::default();
+        let data =
+            nonce::state::Versions::new_current(nonce::State::Initialized(nonce::state::Data {
+                authority: config.signers[0].pubkey(),
+                blockhash,
+                fee_calculator: FeeCalculator::default(),
+            }));
         let nonce_response = json!(Response {
             context: RpcResponseContext { slot: 1 },
             value: json!(RpcAccount::encode(
-                Account::new_data(
-                    1,
-                    &NonceState::Initialized(
-                        NonceMeta::new(&config.signers[0].pubkey()),
-                        blockhash
-                    ),
-                    &system_program::ID,
-                )
-                .unwrap()
+                Account::new_data(1, &data, &system_program::ID,).unwrap()
             )),
         });
         let mut mocks = HashMap::new();
@@ -3193,15 +3289,16 @@ mod tests {
         let bob_keypair = Keypair::new();
         let bob_pubkey = bob_keypair.pubkey();
         let blockhash = Hash::default();
+        let data =
+            nonce::state::Versions::new_current(nonce::State::Initialized(nonce::state::Data {
+                authority: bob_pubkey,
+                blockhash,
+                fee_calculator: FeeCalculator::default(),
+            }));
         let nonce_authority_response = json!(Response {
             context: RpcResponseContext { slot: 1 },
             value: json!(RpcAccount::encode(
-                Account::new_data(
-                    1,
-                    &NonceState::Initialized(NonceMeta::new(&bob_pubkey), blockhash),
-                    &system_program::ID,
-                )
-                .unwrap()
+                Account::new_data(1, &data, &system_program::ID,).unwrap()
             )),
         });
         let mut mocks = HashMap::new();
@@ -3230,8 +3327,22 @@ mod tests {
         let signature = process_command(&config);
         assert_eq!(signature.unwrap(), SIGNATURE.to_string());
 
+        // CreateAddressWithSeed
+        let from_pubkey = Pubkey::new_rand();
+        config.signers = vec![];
+        config.command = CliCommand::CreateAddressWithSeed {
+            from_pubkey: Some(from_pubkey),
+            seed: "seed".to_string(),
+            program_id: solana_stake_program::id(),
+        };
+        let address = process_command(&config);
+        let expected_address =
+            create_address_with_seed(&from_pubkey, "seed", &solana_stake_program::id()).unwrap();
+        assert_eq!(address.unwrap(), expected_address.to_string());
+
         // Need airdrop cases
         let to = Pubkey::new_rand();
+        config.signers = vec![&keypair];
         config.command = CliCommand::Airdrop {
             faucet_host: None,
             faucet_port: 1234,

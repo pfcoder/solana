@@ -4,6 +4,7 @@
 use crate::{
     blockstream_service::BlockstreamService,
     cluster_info::ClusterInfo,
+    cluster_info_vote_listener::VoteTracker,
     commitment::BlockCommitmentCache,
     ledger_cleanup_service::LedgerCleanupService,
     poh_recorder::PohRecorder,
@@ -14,7 +15,6 @@ use crate::{
     shred_fetch_stage::ShredFetchStage,
     sigverify_shreds::ShredSigVerifier,
     sigverify_stage::{DisabledSigVerifier, SigVerifyStage},
-    snapshot_packager_service::SnapshotPackagerService,
     storage_stage::{StorageStage, StorageState},
 };
 use crossbeam_channel::unbounded;
@@ -23,6 +23,7 @@ use solana_ledger::{
     bank_forks::BankForks,
     blockstore::{Blockstore, CompletedSlotsReceiver},
     blockstore_processor::TransactionStatusSender,
+    snapshot_package::SnapshotPackageSender,
 };
 use solana_sdk::{
     pubkey::Pubkey,
@@ -47,7 +48,6 @@ pub struct Tvu {
     blockstream_service: Option<BlockstreamService>,
     ledger_cleanup_service: Option<LedgerCleanupService>,
     storage_stage: StorageStage,
-    snapshot_packager_service: Option<SnapshotPackagerService>,
 }
 
 pub struct Sockets {
@@ -88,6 +88,8 @@ impl Tvu {
         shred_version: u16,
         transaction_status_sender: Option<TransactionStatusSender>,
         rewards_recorder_sender: Option<RewardsRecorderSender>,
+        snapshot_package_sender: Option<SnapshotPackageSender>,
+        vote_tracker: Arc<VoteTracker>,
     ) -> Self {
         let keypair: Arc<Keypair> = cluster_info
             .read()
@@ -148,18 +150,6 @@ impl Tvu {
 
         let (blockstream_slot_sender, blockstream_slot_receiver) = channel();
         let (ledger_cleanup_slot_sender, ledger_cleanup_slot_receiver) = channel();
-        let (snapshot_packager_service, snapshot_package_sender) = {
-            let snapshot_config = { bank_forks.read().unwrap().snapshot_config().clone() };
-            if snapshot_config.is_some() {
-                // Start a snapshot packaging service
-                let (sender, receiver) = channel();
-                let snapshot_packager_service =
-                    SnapshotPackagerService::new(receiver, exit, &cluster_info.clone());
-                (Some(snapshot_packager_service), Some(sender))
-            } else {
-                (None, None)
-            }
-        };
 
         let replay_stage_config = ReplayStageConfig {
             my_pubkey: keypair.pubkey(),
@@ -183,6 +173,7 @@ impl Tvu {
             cluster_info.clone(),
             ledger_signal_receiver,
             poh_recorder.clone(),
+            vote_tracker,
         );
 
         let blockstream_service = if let Some(blockstream_unix_socket) = blockstream_unix_socket {
@@ -225,7 +216,6 @@ impl Tvu {
             blockstream_service,
             ledger_cleanup_service,
             storage_stage,
-            snapshot_packager_service,
         }
     }
 
@@ -241,9 +231,6 @@ impl Tvu {
             self.ledger_cleanup_service.unwrap().join()?;
         }
         self.replay_stage.join()?;
-        if let Some(s) = self.snapshot_packager_service {
-            s.join()?;
-        }
         Ok(())
     }
 }
@@ -317,6 +304,8 @@ pub mod tests {
             0,
             None,
             None,
+            None,
+            Arc::new(VoteTracker::new(&bank)),
         );
         exit.store(true, Ordering::Relaxed);
         tvu.join().unwrap();

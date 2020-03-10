@@ -6,7 +6,7 @@ use crate::{
     append_vec::StoredAccount,
     bank::{HashAgeKind, TransactionProcessResult},
     blockhash_queue::BlockhashQueue,
-    nonce_utils::prepare_if_nonce_account,
+    nonce_utils,
     rent_collector::RentCollector,
     system_instruction_processor::{get_system_account_kind, SystemAccountKind},
     transaction_utils::OrderedIterator,
@@ -17,8 +17,7 @@ use solana_sdk::{
     account::Account,
     clock::Slot,
     hash::Hash,
-    native_loader,
-    nonce_state::NonceState,
+    native_loader, nonce,
     pubkey::Pubkey,
     transaction::Result,
     transaction::{Transaction, TransactionError},
@@ -128,17 +127,13 @@ impl Accounts {
             // If a fee can pay for execution then the program will be scheduled
             let mut accounts: TransactionAccounts = Vec::with_capacity(message.account_keys.len());
             let mut tx_rent: TransactionRent = 0;
-            for (i, key) in message
-                .account_keys
-                .iter()
-                .enumerate()
-                .filter(|(_, key)| !message.program_ids().contains(key))
-            {
+            for (i, key) in message.account_keys.iter().enumerate().filter(|(i, key)| {
+                !message.program_ids().contains(key) || message.is_key_passed_to_program(*i)
+            }) {
                 let (account, rent) = AccountsDB::load(storage, ancestors, accounts_index, key)
                     .and_then(|(mut account, _)| {
-                        let rent_due: u64;
-                        if message.is_writable(i) {
-                            rent_due = rent_collector.update(&mut account);
+                        if message.is_writable(i) && !account.executable {
+                            let rent_due = rent_collector.update(&mut account);
                             Some((account, rent_due))
                         } else {
                             Some((account, 0))
@@ -160,7 +155,7 @@ impl Accounts {
                 })? {
                     SystemAccountKind::System => 0,
                     SystemAccountKind::Nonce => {
-                        rent_collector.rent.minimum_balance(NonceState::size())
+                        rent_collector.rent.minimum_balance(nonce::State::size())
                     }
                 };
 
@@ -266,13 +261,15 @@ impl Accounts {
             .zip(lock_results.into_iter())
             .map(|etx| match etx {
                 (tx, (Ok(()), hash_age_kind)) => {
-                    let fee_hash = if let Some(HashAgeKind::DurableNonce(_, _)) = hash_age_kind {
-                        hash_queue.last_hash()
-                    } else {
-                        tx.message().recent_blockhash
+                    let fee_calculator = match hash_age_kind.as_ref() {
+                        Some(HashAgeKind::DurableNonce(_, account)) => {
+                            nonce_utils::fee_calculator_of(account)
+                        }
+                        _ => hash_queue
+                            .get_fee_calculator(&tx.message().recent_blockhash)
+                            .cloned(),
                     };
-                    let fee = if let Some(fee_calculator) = hash_queue.get_fee_calculator(&fee_hash)
-                    {
+                    let fee = if let Some(fee_calculator) = fee_calculator {
                         fee_calculator.calculate_fee(tx.message())
                     } else {
                         return (Err(TransactionError::BlockhashNotFound), hash_age_kind);
@@ -631,7 +628,13 @@ impl Accounts {
                 .enumerate()
                 .zip(acc.0.iter_mut())
             {
-                prepare_if_nonce_account(account, key, res, maybe_nonce, last_blockhash);
+                nonce_utils::prepare_if_nonce_account(
+                    account,
+                    key,
+                    res,
+                    maybe_nonce,
+                    last_blockhash,
+                );
                 if message.is_writable(i) {
                     if account.rent_epoch == 0 {
                         account.rent_epoch = rent_collector.epoch;
@@ -681,7 +684,7 @@ mod tests {
         hash::Hash,
         instruction::CompiledInstruction,
         message::Message,
-        nonce_state,
+        nonce,
         rent::Rent,
         signature::{Keypair, Signer},
         system_program,
@@ -853,7 +856,7 @@ mod tests {
             instructions,
         );
 
-        let fee_calculator = FeeCalculator::new(10, 0);
+        let fee_calculator = FeeCalculator::new(10);
         assert_eq!(fee_calculator.calculate_fee(tx.message()), 10);
 
         let loaded_accounts =
@@ -915,19 +918,16 @@ mod tests {
                 ..Rent::default()
             },
         );
-        let min_balance = rent_collector
-            .rent
-            .minimum_balance(nonce_state::NonceState::size());
-        let fee_calculator = FeeCalculator::new(min_balance, 0);
+        let min_balance = rent_collector.rent.minimum_balance(nonce::State::size());
+        let fee_calculator = FeeCalculator::new(min_balance);
         let nonce = Keypair::new();
         let mut accounts = vec![(
             nonce.pubkey(),
             Account::new_data(
                 min_balance * 2,
-                &nonce_state::NonceState::Initialized(
-                    nonce_state::Meta::new(&Pubkey::default()),
-                    Hash::default(),
-                ),
+                &nonce::state::Versions::new_current(nonce::State::Initialized(
+                    nonce::state::Data::default(),
+                )),
                 &system_program::id(),
             )
             .unwrap(),
@@ -1103,15 +1103,52 @@ mod tests {
         let key0 = keypair.pubkey();
         let key1 = Pubkey::new(&[5u8; 32]);
 
-        let account = Account::new(1, 1, &Pubkey::default());
+        let account = Account::new(1, 0, &Pubkey::default());
         accounts.push((key0, account));
 
-        let mut account = Account::new(40, 0, &Pubkey::default());
+        let mut account = Account::new(40, 1, &native_loader::id());
         account.executable = true;
-        account.owner = Pubkey::default();
         accounts.push((key1, account));
 
         let instructions = vec![CompiledInstruction::new(0, &(), vec![0])];
+        let tx = Transaction::new_with_compiled_instructions(
+            &[&keypair],
+            &[],
+            Hash::default(),
+            vec![key1],
+            instructions,
+        );
+
+        let loaded_accounts = load_accounts(tx, &accounts, &mut error_counters);
+
+        assert_eq!(error_counters.account_not_found, 1);
+        assert_eq!(loaded_accounts.len(), 1);
+        assert_eq!(
+            loaded_accounts[0],
+            (
+                Err(TransactionError::AccountNotFound),
+                Some(HashAgeKind::Extant)
+            )
+        );
+    }
+
+    #[test]
+    fn test_load_accounts_bad_owner() {
+        let mut accounts: Vec<(Pubkey, Account)> = Vec::new();
+        let mut error_counters = ErrorCounters::default();
+
+        let keypair = Keypair::new();
+        let key0 = keypair.pubkey();
+        let key1 = Pubkey::new(&[5u8; 32]);
+
+        let account = Account::new(1, 0, &Pubkey::default());
+        accounts.push((key0, account));
+
+        let mut account = Account::new(40, 1, &Pubkey::default());
+        account.executable = true;
+        accounts.push((key1, account));
+
+        let instructions = vec![CompiledInstruction::new(1, &(), vec![0])];
         let tx = Transaction::new_with_compiled_instructions(
             &[&keypair],
             &[],
@@ -1145,8 +1182,7 @@ mod tests {
         let account = Account::new(1, 0, &Pubkey::default());
         accounts.push((key0, account));
 
-        let mut account = Account::new(40, 1, &Pubkey::default());
-        account.owner = native_loader::id();
+        let account = Account::new(40, 1, &native_loader::id());
         accounts.push((key1, account));
 
         let instructions = vec![CompiledInstruction::new(1, &(), vec![0])];

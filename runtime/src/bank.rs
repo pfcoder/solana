@@ -35,13 +35,12 @@ use solana_sdk::{
     account::Account,
     clock::{get_segment_from_slot, Epoch, Slot, UnixTimestamp, MAX_RECENT_BLOCKHASHES},
     epoch_schedule::EpochSchedule,
-    fee_calculator::FeeCalculator,
+    fee_calculator::{FeeCalculator, FeeRateGovernor},
     genesis_config::GenesisConfig,
     hard_forks::HardForks,
     hash::{extend_and_hash, hashv, Hash},
     inflation::Inflation,
-    native_loader,
-    nonce_state::NonceState,
+    native_loader, nonce,
     pubkey::Pubkey,
     signature::{Keypair, Signature},
     slot_hashes::SlotHashes,
@@ -63,7 +62,7 @@ use std::{
     sync::{Arc, RwLock, RwLockReadGuard},
 };
 
-pub const SECONDS_PER_YEAR: f64 = (365.25 * 24.0 * 60.0 * 60.0);
+pub const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 60.0 * 60.0;
 pub const MAX_SNAPSHOT_DATA_FILE_SIZE: u64 = 32 * 1024 * 1024 * 1024; // 32 GiB
 
 pub const MAX_LEADER_SCHEDULE_STAKES: Epoch = 5;
@@ -302,6 +301,9 @@ pub struct Bank {
     /// Latest transaction fees for transactions processed by this bank
     fee_calculator: FeeCalculator,
 
+    /// Track cluster signature throughput and adjust fee rate
+    fee_rate_governor: FeeRateGovernor,
+
     /// Rent that have been collected
     #[serde(serialize_with = "serialize_atomicu64")]
     #[serde(deserialize_with = "deserialize_atomicu64")]
@@ -401,6 +403,9 @@ impl Bank {
         let epoch_schedule = parent.epoch_schedule;
         let epoch = epoch_schedule.get_epoch(slot);
 
+        let fee_rate_governor =
+            FeeRateGovernor::new_derived(&parent.fee_rate_governor, parent.signature_count());
+
         let mut new = Bank {
             rc,
             src,
@@ -420,10 +425,8 @@ impl Bank {
             rent_collector: parent.rent_collector.clone_with_epoch(epoch),
             max_tick_height: (slot + 1) * parent.ticks_per_slot,
             block_height: parent.block_height + 1,
-            fee_calculator: FeeCalculator::new_derived(
-                &parent.fee_calculator,
-                parent.signature_count() as usize,
-            ),
+            fee_calculator: fee_rate_governor.create_fee_calculator(),
+            fee_rate_governor,
             capitalization: AtomicU64::new(parent.capitalization()),
             inflation: parent.inflation.clone(),
             transaction_count: AtomicU64::new(parent.transaction_count()),
@@ -745,7 +748,7 @@ impl Bank {
         let collector_fees = self.collector_fees.load(Ordering::Relaxed) as u64;
 
         if collector_fees != 0 {
-            let (unburned, burned) = self.fee_calculator.burn(collector_fees);
+            let (unburned, burned) = self.fee_rate_governor.burn(collector_fees);
             // burn a portion of fees
             self.deposit(&self.collector_id, unburned);
             self.capitalization.fetch_sub(burned, Ordering::Relaxed);
@@ -811,7 +814,8 @@ impl Bank {
 
     fn process_genesis_config(&mut self, genesis_config: &GenesisConfig) {
         // Bootstrap validator collects fees until `new_from_parent` is called.
-        self.fee_calculator = genesis_config.fee_calculator.clone();
+        self.fee_rate_governor = genesis_config.fee_rate_governor.clone();
+        self.fee_calculator = self.fee_rate_governor.create_fee_calculator();
         self.update_fees();
 
         for (pubkey, account) in genesis_config.accounts.iter() {
@@ -903,6 +907,10 @@ impl Bank {
     pub fn get_fee_calculator(&self, hash: &Hash) -> Option<FeeCalculator> {
         let blockhash_queue = self.blockhash_queue.read().unwrap();
         blockhash_queue.get_fee_calculator(hash).cloned()
+    }
+
+    pub fn get_fee_rate_governor(&self) -> &FeeRateGovernor {
+        &self.fee_rate_governor
     }
 
     pub fn confirmed_last_blockhash(&self) -> (Hash, FeeCalculator) {
@@ -1401,19 +1409,20 @@ impl Bank {
         let results = OrderedIterator::new(txs, iteration_order)
             .zip(executed.iter())
             .map(|(tx, (res, hash_age_kind))| {
-                let is_durable_nonce = hash_age_kind
-                    .as_ref()
-                    .map(|hash_age_kind| hash_age_kind.is_durable_nonce())
-                    .unwrap_or(false);
-                let fee_hash = if is_durable_nonce {
-                    self.last_blockhash()
-                } else {
-                    tx.message().recent_blockhash
+                let (fee_calculator, is_durable_nonce) = match hash_age_kind {
+                    Some(HashAgeKind::DurableNonce(_, account)) => {
+                        (nonce_utils::fee_calculator_of(account), true)
+                    }
+                    _ => (
+                        hash_queue
+                            .get_fee_calculator(&tx.message().recent_blockhash)
+                            .cloned(),
+                        false,
+                    ),
                 };
-                let fee = hash_queue
-                    .get_fee_calculator(&fee_hash)
-                    .ok_or(TransactionError::BlockhashNotFound)?
-                    .calculate_fee(tx.message());
+                let fee_calculator = fee_calculator.ok_or(TransactionError::BlockhashNotFound)?;
+
+                let fee = fee_calculator.calculate_fee(tx.message());
 
                 let message = tx.message();
                 match *res {
@@ -1682,9 +1691,10 @@ impl Bank {
         match self.get_account(pubkey) {
             Some(mut account) => {
                 let min_balance = match get_system_account_kind(&account) {
-                    Some(SystemAccountKind::Nonce) => {
-                        self.rent_collector.rent.minimum_balance(NonceState::size())
-                    }
+                    Some(SystemAccountKind::Nonce) => self
+                        .rent_collector
+                        .rent
+                        .minimum_balance(nonce::State::size()),
                     _ => 0,
                 };
                 if lamports + min_balance > account.lamports {
@@ -1907,7 +1917,7 @@ impl Bank {
     /// A snapshot bank should be purged of 0 lamport accounts which are not part of the hash
     /// calculation and could shield other real accounts.
     pub fn verify_snapshot_bank(&self) -> bool {
-        self.purge_zero_lamport_accounts();
+        self.clean_accounts();
         // Order and short-circuiting is significant; verify_hash requires a valid bank hash
         self.verify_bank_hash() && self.verify_hash()
     }
@@ -2100,11 +2110,8 @@ impl Bank {
         );
     }
 
-    pub fn purge_zero_lamport_accounts(&self) {
-        self.rc
-            .accounts
-            .accounts_db
-            .purge_zero_lamport_accounts(&self.ancestors);
+    pub fn clean_accounts(&self) {
+        self.rc.accounts.accounts_db.clean_accounts();
     }
 }
 
@@ -2159,7 +2166,7 @@ mod tests {
         genesis_config::create_genesis_config,
         instruction::{AccountMeta, CompiledInstruction, Instruction, InstructionError},
         message::{Message, MessageHeader},
-        nonce_state,
+        nonce,
         poh_config::PohConfig,
         rent::Rent,
         signature::{Keypair, Signer},
@@ -3153,7 +3160,7 @@ mod tests {
         }
 
         let hash = bank.update_accounts_hash();
-        bank.purge_zero_lamport_accounts();
+        bank.clean_accounts();
         assert_eq!(bank.update_accounts_hash(), hash);
 
         let bank0 = Arc::new(new_from_parent(&bank));
@@ -3173,14 +3180,14 @@ mod tests {
 
         info!("bank0 purge");
         let hash = bank0.update_accounts_hash();
-        bank0.purge_zero_lamport_accounts();
+        bank0.clean_accounts();
         assert_eq!(bank0.update_accounts_hash(), hash);
 
         assert_eq!(bank0.get_account(&keypair.pubkey()).unwrap().lamports, 10);
         assert_eq!(bank1.get_account(&keypair.pubkey()), None);
 
         info!("bank1 purge");
-        bank1.purge_zero_lamport_accounts();
+        bank1.clean_accounts();
 
         assert_eq!(bank0.get_account(&keypair.pubkey()).unwrap().lamports, 10);
         assert_eq!(bank1.get_account(&keypair.pubkey()), None);
@@ -3198,7 +3205,7 @@ mod tests {
         // keypair should have 0 tokens on both forks
         assert_eq!(bank0.get_account(&keypair.pubkey()), None);
         assert_eq!(bank1.get_account(&keypair.pubkey()), None);
-        bank1.purge_zero_lamport_accounts();
+        bank1.clean_accounts();
 
         assert!(bank1.verify_bank_hash());
     }
@@ -3290,7 +3297,7 @@ mod tests {
     #[test]
     fn test_detect_failed_duplicate_transactions() {
         let (mut genesis_config, mint_keypair) = create_genesis_config(2);
-        genesis_config.fee_calculator.lamports_per_signature = 1;
+        genesis_config.fee_rate_governor = FeeRateGovernor::new(1, 0);
         let bank = Bank::new(&genesis_config);
 
         let dest = Keypair::new();
@@ -3407,15 +3414,13 @@ mod tests {
         genesis_config.rent.lamports_per_byte_year = 42;
         let bank = Bank::new(&genesis_config);
 
-        let min_balance =
-            bank.get_minimum_balance_for_rent_exemption(nonce_state::NonceState::size());
+        let min_balance = bank.get_minimum_balance_for_rent_exemption(nonce::State::size());
         let nonce = Keypair::new();
         let nonce_account = Account::new_data(
             min_balance + 42,
-            &nonce_state::NonceState::Initialized(
-                nonce_state::Meta::new(&Pubkey::default()),
-                Hash::default(),
-            ),
+            &nonce::state::Versions::new_current(nonce::State::Initialized(
+                nonce::state::Data::default(),
+            )),
             &system_program::id(),
         )
         .unwrap();
@@ -3450,11 +3455,14 @@ mod tests {
             mint_keypair,
             ..
         } = create_genesis_config_with_leader(mint, &leader, 3);
-        genesis_config.fee_calculator.lamports_per_signature = 4; // something divisible by 2
+        genesis_config.fee_rate_governor = FeeRateGovernor::new(4, 0); // something divisible by 2
 
-        let expected_fee_paid = genesis_config.fee_calculator.lamports_per_signature;
+        let expected_fee_paid = genesis_config
+            .fee_rate_governor
+            .create_fee_calculator()
+            .lamports_per_signature;
         let (expected_fee_collected, expected_fee_burned) =
-            genesis_config.fee_calculator.burn(expected_fee_paid);
+            genesis_config.fee_rate_governor.burn(expected_fee_paid);
 
         let mut bank = Bank::new(&genesis_config);
 
@@ -3521,8 +3529,10 @@ mod tests {
             mint_keypair,
             ..
         } = create_genesis_config_with_leader(1_000_000, &leader, 3);
-        genesis_config.fee_calculator.target_lamports_per_signature = 1000;
-        genesis_config.fee_calculator.target_signatures_per_slot = 1;
+        genesis_config
+            .fee_rate_governor
+            .target_lamports_per_signature = 1000;
+        genesis_config.fee_rate_governor.target_signatures_per_slot = 1;
 
         let mut bank = Bank::new(&genesis_config);
         goto_end_of_slot(&mut bank);
@@ -3571,7 +3581,7 @@ mod tests {
             mint_keypair,
             ..
         } = create_genesis_config_with_leader(100, &leader, 3);
-        genesis_config.fee_calculator.lamports_per_signature = 2;
+        genesis_config.fee_rate_governor = FeeRateGovernor::new(2, 0);
         let bank = Bank::new(&genesis_config);
 
         let key = Keypair::new();
@@ -3598,7 +3608,7 @@ mod tests {
             bank.get_balance(&leader),
             initial_balance
                 + bank
-                    .fee_calculator
+                    .fee_rate_governor
                     .burn(bank.fee_calculator.lamports_per_signature * 2)
                     .0
         );
@@ -4548,15 +4558,20 @@ mod tests {
     }
 
     #[test]
-    fn test_bank_inherit_fee_calculator() {
+    fn test_bank_inherit_fee_rate_governor() {
         let (mut genesis_config, _mint_keypair) = create_genesis_config(500);
-        genesis_config.fee_calculator.target_lamports_per_signature = 123;
+        genesis_config
+            .fee_rate_governor
+            .target_lamports_per_signature = 123;
 
         let bank0 = Arc::new(Bank::new(&genesis_config));
         let bank1 = Arc::new(new_from_parent(&bank0));
         assert_eq!(
-            bank0.fee_calculator.target_lamports_per_signature / 2,
-            bank1.fee_calculator.lamports_per_signature
+            bank0.fee_rate_governor.target_lamports_per_signature / 2,
+            bank1
+                .fee_rate_governor
+                .create_fee_calculator()
+                .lamports_per_signature
         );
     }
 
@@ -4659,7 +4674,7 @@ mod tests {
     #[test]
     fn test_bank_fees_account() {
         let (mut genesis_config, _) = create_genesis_config(500);
-        genesis_config.fee_calculator.lamports_per_signature = 12345;
+        genesis_config.fee_rate_governor = FeeRateGovernor::new(12345, 0);
         let bank = Arc::new(Bank::new(&genesis_config));
 
         let fees_account = bank.get_account(&sysvar::fees::id()).unwrap();
@@ -4869,10 +4884,13 @@ mod tests {
         let mut bank = Bank::new(&genesis_config);
 
         fn mock_vote_processor(
-            _pubkey: &Pubkey,
-            _ka: &[KeyedAccount],
-            _data: &[u8],
+            program_id: &Pubkey,
+            _keyed_accounts: &[KeyedAccount],
+            _instruction_data: &[u8],
         ) -> std::result::Result<(), InstructionError> {
+            if !solana_vote_program::check_id(program_id) {
+                return Err(InstructionError::IncorrectProgramId);
+            }
             Err(InstructionError::CustomError(42))
         }
 
@@ -4976,9 +4994,9 @@ mod tests {
                 sysvar::recent_blockhashes::RecentBlockhashes::from_account(&bhq_account).unwrap();
             // Check length
             assert_eq!(recent_blockhashes.len(), i);
-            let most_recent_hash = recent_blockhashes.iter().nth(0).unwrap();
+            let most_recent_hash = recent_blockhashes.iter().nth(0).unwrap().blockhash;
             // Check order
-            assert_eq!(Some(true), bank.check_hash_age(most_recent_hash, 0));
+            assert_eq!(Some(true), bank.check_hash_age(&most_recent_hash, 0));
             goto_end_of_slot(Arc::get_mut(&mut bank).unwrap());
             bank = Arc::new(new_from_parent(&bank));
         }
@@ -5082,11 +5100,14 @@ mod tests {
     }
 
     fn get_nonce_account(bank: &Bank, nonce_pubkey: &Pubkey) -> Option<Hash> {
-        bank.get_account(&nonce_pubkey)
-            .and_then(|acc| match acc.state() {
-                Ok(nonce_state::NonceState::Initialized(_meta, hash)) => Some(hash),
+        bank.get_account(&nonce_pubkey).and_then(|acc| {
+            let state =
+                StateMut::<nonce::state::Versions>::state(&acc).map(|v| v.convert_to_current());
+            match state {
+                Ok(nonce::State::Initialized(ref data)) => Some(data.blockhash),
                 _ => None,
-            })
+            }
+        })
     }
 
     fn nonce_setup(
@@ -5134,6 +5155,13 @@ mod tests {
         genesis_config.rent.lamports_per_byte_year = 0;
         genesis_cfg_fn(&mut genesis_config);
         let mut bank = Arc::new(Bank::new(&genesis_config));
+
+        // Banks 0 and 1 have no fees, wait two blocks before
+        // initializing our nonce accounts
+        for _ in 0..2 {
+            goto_end_of_slot(Arc::get_mut(&mut bank).unwrap());
+            bank = Arc::new(new_from_parent(&bank));
+        }
 
         let (custodian_keypair, nonce_keypair) = nonce_setup(
             &mut bank,
@@ -5258,10 +5286,9 @@ mod tests {
         let nonce = Keypair::new();
         let nonce_account = Account::new_data(
             42424242,
-            &nonce_state::NonceState::Initialized(
-                nonce_state::Meta::new(&Pubkey::default()),
-                Hash::default(),
-            ),
+            &nonce::state::Versions::new_current(nonce::State::Initialized(
+                nonce::state::Data::default(),
+            )),
             &system_program::id(),
         )
         .unwrap();
@@ -5443,8 +5470,8 @@ mod tests {
     #[test]
     fn test_pre_post_transaction_balances() {
         let (mut genesis_config, _mint_keypair) = create_genesis_config(500);
-        let fee_calculator = FeeCalculator::new(1, 0);
-        genesis_config.fee_calculator = fee_calculator;
+        let fee_rate_governor = FeeRateGovernor::new(1, 0);
+        genesis_config.fee_rate_governor = fee_rate_governor;
         let parent = Arc::new(Bank::new(&genesis_config));
         let bank0 = Arc::new(new_from_parent(&parent));
 
@@ -5541,5 +5568,47 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(bank.get_balance(&from_pubkey), 80);
         assert_eq!(bank.get_balance(&to_pubkey), 20);
+    }
+
+    #[test]
+    fn test_transaction_with_program_ids_passed_to_programs() {
+        let (genesis_config, mint_keypair) = create_genesis_config(500);
+        let mut bank = Bank::new(&genesis_config);
+
+        fn mock_process_instruction(
+            _program_id: &Pubkey,
+            _keyed_accounts: &[KeyedAccount],
+            _data: &[u8],
+        ) -> result::Result<(), InstructionError> {
+            Ok(())
+        }
+
+        let mock_program_id = Pubkey::new(&[2u8; 32]);
+        bank.add_instruction_processor(mock_program_id, mock_process_instruction);
+
+        let from_pubkey = Pubkey::new_rand();
+        let to_pubkey = Pubkey::new_rand();
+        let dup_pubkey = from_pubkey.clone();
+        let from_account = Account::new(100, 1, &mock_program_id);
+        let to_account = Account::new(0, 1, &mock_program_id);
+        bank.store_account(&from_pubkey, &from_account);
+        bank.store_account(&to_pubkey, &to_account);
+
+        let account_metas = vec![
+            AccountMeta::new(from_pubkey, false),
+            AccountMeta::new(to_pubkey, false),
+            AccountMeta::new(dup_pubkey, false),
+            AccountMeta::new(mock_program_id, false),
+        ];
+        let instruction = Instruction::new(mock_program_id, &10, account_metas);
+        let tx = Transaction::new_signed_with_payer(
+            vec![instruction],
+            Some(&mint_keypair.pubkey()),
+            &[&mint_keypair],
+            bank.last_blockhash(),
+        );
+
+        let result = bank.process_transaction(&tx);
+        assert_eq!(result, Ok(()));
     }
 }

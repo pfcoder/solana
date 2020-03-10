@@ -18,10 +18,10 @@ const HID_GLOBAL_USAGE_PAGE: u16 = 0xFF00;
 const HID_USB_DEVICE_CLASS: u8 = 0;
 
 /// Remote wallet error.
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum RemoteWalletError {
     #[error("hidapi error")]
-    Hid(#[from] hidapi::HidError),
+    Hid(String),
 
     #[error("device type mismatch")]
     DeviceTypeMismatch,
@@ -51,12 +51,16 @@ pub enum RemoteWalletError {
     UserCancel,
 }
 
+impl From<hidapi::HidError> for RemoteWalletError {
+    fn from(err: hidapi::HidError) -> RemoteWalletError {
+        RemoteWalletError::Hid(err.to_string())
+    }
+}
+
 impl From<RemoteWalletError> for SignerError {
     fn from(err: RemoteWalletError) -> SignerError {
         match err {
-            RemoteWalletError::Hid(hid_error) => {
-                SignerError::ConnectionError(hid_error.to_string())
-            }
+            RemoteWalletError::Hid(hid_error) => SignerError::ConnectionError(hid_error),
             RemoteWalletError::DeviceTypeMismatch => SignerError::ConnectionError(err.to_string()),
             RemoteWalletError::InvalidDevice => SignerError::ConnectionError(err.to_string()),
             RemoteWalletError::InvalidInput(input) => SignerError::InvalidInput(input),
@@ -90,21 +94,20 @@ impl RemoteWalletManager {
     pub fn update_devices(&self) -> Result<usize, RemoteWalletError> {
         let mut usb = self.usb.lock();
         usb.refresh_devices()?;
-        let devices = usb.devices();
+        let devices = usb.device_list();
         let num_prev_devices = self.devices.read().len();
 
         let detected_devices = devices
-            .iter()
             .filter(|&device_info| {
-                is_valid_hid_device(device_info.usage_page, device_info.interface_number)
+                is_valid_hid_device(device_info.usage_page(), device_info.interface_number())
             })
             .fold(Vec::new(), |mut v, device_info| {
-                if is_valid_ledger(device_info.vendor_id, device_info.product_id) {
-                    match usb.open_path(&device_info.path) {
+                if is_valid_ledger(device_info.vendor_id(), device_info.product_id()) {
+                    match usb.open_path(&device_info.path()) {
                         Ok(device) => {
                             let ledger = LedgerWallet::new(device);
                             if let Ok(info) = ledger.read_device(&device_info) {
-                                let path = device_info.path.to_str().unwrap().to_string();
+                                let path = device_info.path().to_str().unwrap().to_string();
                                 trace!("Found device: {:?}", info);
                                 v.push(Device {
                                     path,
@@ -172,7 +175,7 @@ pub trait RemoteWallet {
     /// Parse device info and get device base pubkey
     fn read_device(
         &self,
-        dev_info: &hidapi::HidDeviceInfo,
+        dev_info: &hidapi::DeviceInfo,
     ) -> Result<RemoteWalletInfo, RemoteWalletError>;
 
     /// Get solana pubkey from a RemoteWallet
@@ -215,6 +218,8 @@ pub struct RemoteWalletInfo {
     pub serial: String,
     /// Base pubkey of device at Solana derivation path
     pub pubkey: Pubkey,
+    /// Initial read error
+    pub error: Option<RemoteWalletError>,
 }
 
 impl RemoteWalletInfo {
@@ -360,6 +365,7 @@ mod tests {
             manufacturer: "ledger".to_string(),
             serial: "".to_string(),
             pubkey,
+            error: None,
         }));
         assert_eq!(
             derivation_path,
@@ -376,6 +382,7 @@ mod tests {
             manufacturer: "ledger".to_string(),
             serial: "".to_string(),
             pubkey,
+            error: None,
         }));
         assert_eq!(
             derivation_path,
@@ -392,6 +399,7 @@ mod tests {
             manufacturer: "ledger".to_string(),
             serial: "".to_string(),
             pubkey,
+            error: None,
         }));
         assert_eq!(
             derivation_path,
@@ -408,6 +416,7 @@ mod tests {
             manufacturer: "ledger".to_string(),
             serial: "".to_string(),
             pubkey,
+            error: None,
         }));
         assert_eq!(
             derivation_path,
@@ -424,6 +433,7 @@ mod tests {
             manufacturer: "ledger".to_string(),
             serial: "".to_string(),
             pubkey,
+            error: None,
         }));
         assert_eq!(
             derivation_path,
@@ -441,6 +451,7 @@ mod tests {
             manufacturer: "ledger".to_string(),
             serial: "".to_string(),
             pubkey: Pubkey::default(),
+            error: None,
         }));
         assert_eq!(
             derivation_path,
@@ -456,6 +467,7 @@ mod tests {
             manufacturer: "ledger".to_string(),
             serial: "".to_string(),
             pubkey: Pubkey::default(),
+            error: None,
         }));
         assert_eq!(
             derivation_path,
@@ -490,6 +502,7 @@ mod tests {
             model: "Nano S".to_string(),
             serial: "0001".to_string(),
             pubkey: pubkey.clone(),
+            error: None,
         };
         let mut test_info = RemoteWalletInfo::default();
         test_info.manufacturer = "Not Ledger".to_string();

@@ -24,7 +24,10 @@ To interact with a Solana node inside a JavaScript application, use the [solana-
 * [getConfirmedBlocks](jsonrpc-api.md#getconfirmedblocks)
 * [getEpochInfo](jsonrpc-api.md#getepochinfo)
 * [getEpochSchedule](jsonrpc-api.md#getepochschedule)
+* [getFeeCalculatorForBlockhash](jsonrpc-api.md#getfeecalculatorforblockhash)
+* [getFeeRateGovernor](jsonrpc-api.md#getfeerategovernor)
 * [getGenesisHash](jsonrpc-api.md#getgenesishash)
+* [getIdentity](jsonrpc-api.md#getidentity)
 * [getInflation](jsonrpc-api.md#getinflation)
 * [getLeaderSchedule](jsonrpc-api.md#getleaderschedule)
 * [getMinimumBalanceForRentExemption](jsonrpc-api.md#getminimumbalanceforrentexemption)
@@ -403,6 +406,58 @@ curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1, "m
 {"jsonrpc":"2.0","result":{"firstNormalEpoch":8,"firstNormalSlot":8160,"leaderScheduleSlotOffset":8192,"slotsPerEpoch":8192,"warmup":true},"id":1}
 ```
 
+### getFeeCalculatorForBlockhash
+
+Returns the fee calculator associated with the query blockhash, or `null` if the blockhash has expired
+
+#### Parameters:
+
+* `blockhash: <string>`, query blockhash as a Base58 encoded string
+
+#### Results:
+
+The `result` field will be `null` if the query blockhash has expired, otherwise an `object` with the following fields:
+
+* `feeCalculator: <object>`, `FeeCalculator` object describing the cluster fee rate at the queried blockhash
+
+#### Example:
+
+```bash
+// Request
+curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1, "method":"getFeeCalculatorForBlockhash", "params":["GJxqhuxcgfn5Tcj6y3f8X4FeCDd2RQ6SnEMo1AAxrPRZ"]}' http://localhost:8899
+
+// Result
+{"jsonrpc":"2.0","result":{"context":{"slot":221},"value":{"feeCalculator":{"lamportsPerSignature":5000}}},"id":1}
+```
+
+### getFeeRateGovernor
+
+Returns the fee rate governor information from the root bank
+
+#### Parameters:
+
+None
+
+#### Results:
+
+The `result` field will be an `object` with the following fields:
+
+* `burnPercent: <u8>`, Percentage of fees collected to be destroyed
+* `maxLamportsPerSignature: <u64>`, Largest value `lamportsPerSignature` can attain for the next slot
+* `minLamportsPerSignature: <u64>`, Smallest value `lamportsPerSignature` can attain for the next slot
+* `targetLamportsPerSignature: <u64>`, Desired fee rate for the cluster
+* `targetSignaturesPerSlot: <u64>`, Desired signature rate for the cluster
+
+#### Example:
+
+```bash
+// Request
+curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1, "method":"getFeeRateGovernor"}' http://localhost:8899
+
+// Result
+{"jsonrpc":"2.0","result":{"context":{"slot":54},"value":{"feeRateGovernor":{"burnPercent":50,"maxLamportsPerSignature":100000,"minLamportsPerSignature":5000,"targetLamportsPerSignature":10000,"targetSignaturesPerSlot":20000}}},"id":1}
+```
+
 ### getGenesisHash
 
 Returns the genesis hash
@@ -423,6 +478,29 @@ curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1, "m
 
 // Result
 {"jsonrpc":"2.0","result":"GH7ome3EiwEr7tu9JuTh2dpYWBJK3z69Xm1ZE3MEE6JC","id":1}
+```
+
+### getIdentity
+
+Returns the identity pubkey for the current node
+
+#### Parameters:
+
+None
+
+#### Results:
+
+The result field will be a JSON object with the following fields:
+
+* `identity`, the identity pubkey of the current node \(as a base-58 encoded string\)
+
+#### Example:
+
+```bash
+// Request
+curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1, "method":"getIdentity"}' http://localhost:8899
+// Result
+{"jsonrpc":"2.0","result":{"identity": "2r1F4iWqVcb8M1DbAjQuFpebkQHY9hcVU4WuW2DJBppN"},"id":1}
 ```
 
 ### getInflation
@@ -916,7 +994,7 @@ Creates new transaction
 
 #### Parameters:
 
-* `<array>` - array of octets containing a fully-signed Transaction
+* `<string>` - fully-signed Transaction, as base-58 encoded string
 
 #### Results:
 

@@ -6,15 +6,60 @@ secure transaction signing.
 
 ## Before You Begin
 
+- [Install the Solana command-line tools](../install-solana.md)
 - [Initialize your Ledger Nano S](https://support.ledger.com/hc/en-us/articles/360000613793)
 - [Install the latest device firmware](https://support.ledgerwallet.com/hc/en-us/articles/360002731113-Update-Ledger-Nano-S-firmware)
-- [Install Ledger Live](https://support.ledger.com/hc/en-us/articles/360006395553/) software on your computer
 
 ## Install the Solana App on Ledger Nano S
 
+The Solana Ledger app is not yet available on Ledger Live. Until it is, you
+can install a development version of the app from the command-line. Note that
+because the app is not installed via Ledger Live, you will need to approve
+installation from an "unsafe" manager, as well as see the message, "This app
+is not genuine" each time you open the app. Once the app is available on
+Ledger Live, you can reinstall the app from there, and the message will no
+longer be displayed.
+
+1. Connect your Ledger device via USB and enter your pin to unlock it
+2. Download and run the Solana Ledger app installer:
+   ```text
+   curl -sSLf https://github.com/solana-labs/ledger-app-solana/releases/download/v0.1.1/install.sh | sh
+   ```
+3. When prompted, approve the "unsafe" manager on your device
+4. When prompted, approve the installation on your device
+5. An installation window appears and your device will display Processing…
+6. The app installation is confirmed
+
+### Troubleshooting
+
+If you encounter the following error:
+
+```text
+Traceback (most recent call last):
+ File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.7/lib/python3.7/runpy.py", line 193, in _run_module_as_main
+  "__main__", mod_spec)
+ File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.7/lib/python3.7/runpy.py", line 85, in _run_code
+  exec(code, run_globals)
+ File "ledger-env/lib/python3.7/site-packages/ledgerblue/loadApp.py", line 197, in <module>
+  dongle = getDongle(args.apdu)
+ File "ledger-env/lib/python3.7/site-packages/ledgerblue/comm.py", line 216, in getDongle
+  dev.open_path(hidDevicePath)
+ File "hid.pyx", line 72, in hid.device.open_path
+OSError: open failed
+```
+
+To fix, check the following:
+1. Ensure your Ledger device is connected to USB
+2. Ensure your Ledger device is unlocked and not waiting for you to enter your pin
+3. Ensure the Ledger Live application is not open
+
+### Future: Installation once the Solana app is on Ledger Live
+
+- [Install Ledger Live](https://support.ledger.com/hc/en-us/articles/360006395553/) software on your computer
+
 1. Open the Manager in Ledger Live
-2. Connect and unlock your Ledger Nano S
-3. If asked, allow the manager on your device by pressing the right button
+2. Connect your Ledger device via USB and enter your pin to unlock it
+3. When prompted, approve the manager on your device
 4. Find Solana in the app catalog and click Install
 5. An installation window appears and your device will display Processing…
 6. The app installation is confirmed
@@ -77,6 +122,12 @@ usb://ledger/nano-s/BsNsvfXqQTtJnagwFWdBS7FBXgnsK8VZ5CmuznN85swK?key=0/0
 ```
 
 ### Set CLI Configuration
+
+Configure the `solana` CLI tool to connect to a particular cluster:
+
+```bash
+solana config set --url <CLUSTER_URL> # (i.e. http://devnet.solana.com:8899)
+```
 
 If you want to set a Ledger key as the default signer for CLI commands, use the
 [CLI configuration settings](../cli/usage.md#solana-config):

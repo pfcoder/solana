@@ -1,9 +1,10 @@
 use crate::keypair::{
-    keypair_from_seed_phrase, signer_from_path, ASK_KEYWORD, SKIP_SEED_PHRASE_VALIDATION_ARG,
+    keypair_from_seed_phrase, pubkey_from_path, signer_from_path, ASK_KEYWORD,
+    SKIP_SEED_PHRASE_VALIDATION_ARG,
 };
 use chrono::DateTime;
 use clap::ArgMatches;
-use solana_remote_wallet::remote_wallet::{DerivationPath, RemoteWalletManager};
+use solana_remote_wallet::remote_wallet::RemoteWalletManager;
 use solana_sdk::{
     clock::UnixTimestamp,
     native_token::sol_to_lamports,
@@ -111,18 +112,25 @@ pub fn signer_of(
     }
 }
 
-pub fn lamports_of_sol(matches: &ArgMatches<'_>, name: &str) -> Option<u64> {
-    value_of(matches, name).map(sol_to_lamports)
+pub fn pubkey_of_signer(
+    matches: &ArgMatches<'_>,
+    name: &str,
+    wallet_manager: Option<&Arc<RemoteWalletManager>>,
+) -> Result<Option<Pubkey>, Box<dyn std::error::Error>> {
+    if let Some(location) = matches.value_of(name) {
+        Ok(Some(pubkey_from_path(
+            matches,
+            location,
+            name,
+            wallet_manager,
+        )?))
+    } else {
+        Ok(None)
+    }
 }
 
-pub fn derivation_of(matches: &ArgMatches<'_>, name: &str) -> Option<DerivationPath> {
-    matches.value_of(name).map(|derivation_str| {
-        let derivation_str = derivation_str.replace("'", "");
-        let mut parts = derivation_str.split('/');
-        let account = parts.next().map(|account| account.parse::<u32>().unwrap());
-        let change = parts.next().map(|change| change.parse::<u32>().unwrap());
-        DerivationPath { account, change }
-    })
+pub fn lamports_of_sol(matches: &ArgMatches<'_>, name: &str) -> Option<u64> {
+    value_of(matches, name).map(sol_to_lamports)
 }
 
 #[cfg(test)]
@@ -298,41 +306,5 @@ mod tests {
             .clone()
             .get_matches_from(vec!["test", "--single", "0.03"]);
         assert_eq!(lamports_of_sol(&matches, "single"), Some(30000000));
-    }
-
-    #[test]
-    fn test_derivation_of() {
-        let matches = app()
-            .clone()
-            .get_matches_from(vec!["test", "--single", "2/3"]);
-        assert_eq!(
-            derivation_of(&matches, "single"),
-            Some(DerivationPath {
-                account: Some(2),
-                change: Some(3)
-            })
-        );
-        assert_eq!(derivation_of(&matches, "another"), None);
-        let matches = app()
-            .clone()
-            .get_matches_from(vec!["test", "--single", "2"]);
-        assert_eq!(
-            derivation_of(&matches, "single"),
-            Some(DerivationPath {
-                account: Some(2),
-                change: None
-            })
-        );
-        assert_eq!(derivation_of(&matches, "another"), None);
-        let matches = app()
-            .clone()
-            .get_matches_from(vec!["test", "--single", "2'/3'"]);
-        assert_eq!(
-            derivation_of(&matches, "single"),
-            Some(DerivationPath {
-                account: Some(2),
-                change: Some(3)
-            })
-        );
     }
 }

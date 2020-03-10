@@ -9,12 +9,15 @@ use solana_faucet::faucet::run_local_faucet;
 use solana_sdk::{
     account_utils::StateMut,
     fee_calculator::FeeCalculator,
-    nonce_state::NonceState,
+    nonce,
     pubkey::Pubkey,
     signature::{keypair_from_seed, Keypair, Signer},
     system_instruction::create_address_with_seed,
 };
-use solana_stake_program::stake_state::{Lockup, StakeAuthorize, StakeState};
+use solana_stake_program::{
+    stake_instruction::LockupArgs,
+    stake_state::{Lockup, StakeAuthorize, StakeState},
+};
 use std::{fs::remove_dir_all, sync::mpsc::channel, thread::sleep, time::Duration};
 
 fn check_balance(expected_balance: u64, client: &RpcClient, pubkey: &Pubkey) {
@@ -454,7 +457,7 @@ fn test_nonced_stake_delegation_and_deactivation() {
     config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
 
     let minimum_nonce_balance = rpc_client
-        .get_minimum_balance_for_rent_exemption(NonceState::size())
+        .get_minimum_balance_for_rent_exemption(nonce::State::size())
         .unwrap();
 
     request_and_confirm_airdrop(
@@ -497,9 +500,11 @@ fn test_nonced_stake_delegation_and_deactivation() {
 
     // Fetch nonce hash
     let account = rpc_client.get_account(&nonce_account.pubkey()).unwrap();
-    let nonce_state: NonceState = account.state().unwrap();
+    let nonce_state = StateMut::<nonce::state::Versions>::state(&account)
+        .unwrap()
+        .convert_to_current();
     let nonce_hash = match nonce_state {
-        NonceState::Initialized(_meta, hash) => hash,
+        nonce::State::Initialized(ref data) => data.blockhash,
         _ => panic!("Nonce is not initialized"),
     };
 
@@ -520,9 +525,11 @@ fn test_nonced_stake_delegation_and_deactivation() {
 
     // Fetch nonce hash
     let account = rpc_client.get_account(&nonce_account.pubkey()).unwrap();
-    let nonce_state: NonceState = account.state().unwrap();
+    let nonce_state = StateMut::<nonce::state::Versions>::state(&account)
+        .unwrap()
+        .convert_to_current();
     let nonce_hash = match nonce_state {
-        NonceState::Initialized(_meta, hash) => hash,
+        nonce::State::Initialized(ref data) => data.blockhash,
         _ => panic!("Nonce is not initialized"),
     };
 
@@ -697,7 +704,7 @@ fn test_stake_authorize() {
 
     // Create nonce account
     let minimum_nonce_balance = rpc_client
-        .get_minimum_balance_for_rent_exemption(NonceState::size())
+        .get_minimum_balance_for_rent_exemption(nonce::State::size())
         .unwrap();
     let nonce_account = Keypair::new();
     config.signers = vec![&default_signer, &nonce_account];
@@ -711,9 +718,11 @@ fn test_stake_authorize() {
 
     // Fetch nonce hash
     let account = rpc_client.get_account(&nonce_account.pubkey()).unwrap();
-    let nonce_state: NonceState = account.state().unwrap();
+    let nonce_state = StateMut::<nonce::state::Versions>::state(&account)
+        .unwrap()
+        .convert_to_current();
     let nonce_hash = match nonce_state {
-        NonceState::Initialized(_meta, hash) => hash,
+        nonce::State::Initialized(ref data) => data.blockhash,
         _ => panic!("Nonce is not initialized"),
     };
 
@@ -760,9 +769,11 @@ fn test_stake_authorize() {
     };
     assert_eq!(current_authority, online_authority_pubkey);
     let account = rpc_client.get_account(&nonce_account.pubkey()).unwrap();
-    let nonce_state: NonceState = account.state().unwrap();
+    let nonce_state = StateMut::<nonce::state::Versions>::state(&account)
+        .unwrap()
+        .convert_to_current();
     let new_nonce_hash = match nonce_state {
-        NonceState::Initialized(_meta, hash) => hash,
+        nonce::State::Initialized(ref data) => data.blockhash,
         _ => panic!("Nonce is not initialized"),
     };
     assert_ne!(nonce_hash, new_nonce_hash);
@@ -979,7 +990,7 @@ fn test_stake_split() {
 
     // Create nonce account
     let minimum_nonce_balance = rpc_client
-        .get_minimum_balance_for_rent_exemption(NonceState::size())
+        .get_minimum_balance_for_rent_exemption(nonce::State::size())
         .unwrap();
     let nonce_account = keypair_from_seed(&[1u8; 32]).unwrap();
     config.signers = vec![&default_signer, &nonce_account];
@@ -994,9 +1005,11 @@ fn test_stake_split() {
 
     // Fetch nonce hash
     let account = rpc_client.get_account(&nonce_account.pubkey()).unwrap();
-    let nonce_state: NonceState = account.state().unwrap();
+    let nonce_state = StateMut::<nonce::state::Versions>::state(&account)
+        .unwrap()
+        .convert_to_current();
     let nonce_hash = match nonce_state {
-        NonceState::Initialized(_meta, hash) => hash,
+        nonce::State::Initialized(ref data) => data.blockhash,
         _ => panic!("Nonce is not initialized"),
     };
 
@@ -1128,10 +1141,10 @@ fn test_stake_set_lockup() {
     );
 
     // Online set lockup
-    let mut lockup = Lockup {
-        unix_timestamp: 1581534570,
-        epoch: 200,
-        custodian: Pubkey::default(),
+    let lockup = LockupArgs {
+        unix_timestamp: Some(1581534570),
+        epoch: Some(200),
+        custodian: None,
     };
     config.signers.pop();
     config.command = CliCommand::StakeSetLockup {
@@ -1151,17 +1164,21 @@ fn test_stake_set_lockup() {
         StakeState::Initialized(meta) => meta.lockup,
         _ => panic!("Unexpected stake state!"),
     };
-    lockup.custodian = config.signers[0].pubkey(); // Default new_custodian is config.signers[0]
-    assert_eq!(current_lockup, lockup);
+    assert_eq!(
+        current_lockup.unix_timestamp,
+        lockup.unix_timestamp.unwrap()
+    );
+    assert_eq!(current_lockup.epoch, lockup.epoch.unwrap());
+    assert_eq!(current_lockup.custodian, config.signers[0].pubkey());
 
     // Set custodian to another pubkey
     let online_custodian = Keypair::new();
     let online_custodian_pubkey = online_custodian.pubkey();
 
-    let lockup = Lockup {
-        unix_timestamp: 1581534571,
-        epoch: 201,
-        custodian: online_custodian_pubkey,
+    let lockup = LockupArgs {
+        unix_timestamp: Some(1581534571),
+        epoch: Some(201),
+        custodian: Some(online_custodian_pubkey),
     };
     config.command = CliCommand::StakeSetLockup {
         stake_account_pubkey,
@@ -1175,10 +1192,10 @@ fn test_stake_set_lockup() {
     };
     process_command(&config).unwrap();
 
-    let mut lockup = Lockup {
-        unix_timestamp: 1581534572,
-        epoch: 202,
-        custodian: Pubkey::default(),
+    let lockup = LockupArgs {
+        unix_timestamp: Some(1581534572),
+        epoch: Some(202),
+        custodian: None,
     };
     config.signers = vec![&default_signer, &online_custodian];
     config.command = CliCommand::StakeSetLockup {
@@ -1198,14 +1215,18 @@ fn test_stake_set_lockup() {
         StakeState::Initialized(meta) => meta.lockup,
         _ => panic!("Unexpected stake state!"),
     };
-    lockup.custodian = online_custodian_pubkey; // Default new_custodian is designated custodian
-    assert_eq!(current_lockup, lockup);
+    assert_eq!(
+        current_lockup.unix_timestamp,
+        lockup.unix_timestamp.unwrap()
+    );
+    assert_eq!(current_lockup.epoch, lockup.epoch.unwrap());
+    assert_eq!(current_lockup.custodian, online_custodian_pubkey);
 
     // Set custodian to offline pubkey
-    let lockup = Lockup {
-        unix_timestamp: 1581534573,
-        epoch: 203,
-        custodian: offline_pubkey,
+    let lockup = LockupArgs {
+        unix_timestamp: Some(1581534573),
+        epoch: Some(203),
+        custodian: Some(offline_pubkey),
     };
     config.command = CliCommand::StakeSetLockup {
         stake_account_pubkey,
@@ -1221,7 +1242,7 @@ fn test_stake_set_lockup() {
 
     // Create nonce account
     let minimum_nonce_balance = rpc_client
-        .get_minimum_balance_for_rent_exemption(NonceState::size())
+        .get_minimum_balance_for_rent_exemption(nonce::State::size())
         .unwrap();
     let nonce_account = keypair_from_seed(&[1u8; 32]).unwrap();
     let nonce_account_pubkey = nonce_account.pubkey();
@@ -1237,17 +1258,19 @@ fn test_stake_set_lockup() {
 
     // Fetch nonce hash
     let account = rpc_client.get_account(&nonce_account_pubkey).unwrap();
-    let nonce_state: NonceState = account.state().unwrap();
+    let nonce_state = StateMut::<nonce::state::Versions>::state(&account)
+        .unwrap()
+        .convert_to_current();
     let nonce_hash = match nonce_state {
-        NonceState::Initialized(_meta, hash) => hash,
+        nonce::State::Initialized(ref data) => data.blockhash,
         _ => panic!("Nonce is not initialized"),
     };
 
     // Nonced offline set lockup
-    let lockup = Lockup {
-        unix_timestamp: 1581534576,
-        epoch: 222,
-        custodian: offline_pubkey,
+    let lockup = LockupArgs {
+        unix_timestamp: Some(1581534576),
+        epoch: Some(222),
+        custodian: None,
     };
     config_offline.command = CliCommand::StakeSetLockup {
         stake_account_pubkey,
@@ -1280,7 +1303,12 @@ fn test_stake_set_lockup() {
         StakeState::Initialized(meta) => meta.lockup,
         _ => panic!("Unexpected stake state!"),
     };
-    assert_eq!(current_lockup, lockup);
+    assert_eq!(
+        current_lockup.unix_timestamp,
+        lockup.unix_timestamp.unwrap()
+    );
+    assert_eq!(current_lockup.epoch, lockup.epoch.unwrap());
+    assert_eq!(current_lockup.custodian, offline_pubkey);
 
     server.close().unwrap();
     remove_dir_all(ledger_path).unwrap();
@@ -1331,7 +1359,7 @@ fn test_offline_nonced_create_stake_account_and_withdraw() {
 
     // Create nonce account
     let minimum_nonce_balance = rpc_client
-        .get_minimum_balance_for_rent_exemption(NonceState::size())
+        .get_minimum_balance_for_rent_exemption(nonce::State::size())
         .unwrap();
     let nonce_account = keypair_from_seed(&[3u8; 32]).unwrap();
     let nonce_pubkey = nonce_account.pubkey();
@@ -1346,9 +1374,11 @@ fn test_offline_nonced_create_stake_account_and_withdraw() {
 
     // Fetch nonce hash
     let account = rpc_client.get_account(&nonce_account.pubkey()).unwrap();
-    let nonce_state: NonceState = account.state().unwrap();
+    let nonce_state = StateMut::<nonce::state::Versions>::state(&account)
+        .unwrap()
+        .convert_to_current();
     let nonce_hash = match nonce_state {
-        NonceState::Initialized(_meta, hash) => hash,
+        nonce::State::Initialized(ref data) => data.blockhash,
         _ => panic!("Nonce is not initialized"),
     };
 
@@ -1394,9 +1424,11 @@ fn test_offline_nonced_create_stake_account_and_withdraw() {
 
     // Fetch nonce hash
     let account = rpc_client.get_account(&nonce_account.pubkey()).unwrap();
-    let nonce_state: NonceState = account.state().unwrap();
+    let nonce_state = StateMut::<nonce::state::Versions>::state(&account)
+        .unwrap()
+        .convert_to_current();
     let nonce_hash = match nonce_state {
-        NonceState::Initialized(_meta, hash) => hash,
+        nonce::State::Initialized(ref data) => data.blockhash,
         _ => panic!("Nonce is not initialized"),
     };
 
@@ -1435,9 +1467,11 @@ fn test_offline_nonced_create_stake_account_and_withdraw() {
 
     // Fetch nonce hash
     let account = rpc_client.get_account(&nonce_account.pubkey()).unwrap();
-    let nonce_state: NonceState = account.state().unwrap();
+    let nonce_state = StateMut::<nonce::state::Versions>::state(&account)
+        .unwrap()
+        .convert_to_current();
     let nonce_hash = match nonce_state {
-        NonceState::Initialized(_meta, hash) => hash,
+        nonce::State::Initialized(ref data) => data.blockhash,
         _ => panic!("Nonce is not initialized"),
     };
 

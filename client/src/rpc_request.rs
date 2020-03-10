@@ -15,11 +15,14 @@ pub enum RpcRequest {
     GetEpochInfo,
     GetEpochSchedule,
     GetGenesisHash,
+    GetIdentity,
     GetInflation,
     GetLeaderSchedule,
     GetNumBlocksSinceSignatureConfirmation,
     GetProgramAccounts,
     GetRecentBlockhash,
+    GetFeeCalculatorForBlockhash,
+    GetFeeRateGovernor,
     GetSignatureStatus,
     GetSlot,
     GetSlotLeader,
@@ -27,6 +30,7 @@ pub enum RpcRequest {
     GetStorageTurnRate,
     GetSlotsPerSegment,
     GetStoragePubkeysForSlot,
+    GetTotalSupply,
     GetTransactionCount,
     GetVersion,
     GetVoteAccounts,
@@ -54,6 +58,7 @@ impl RpcRequest {
             RpcRequest::GetEpochInfo => "getEpochInfo",
             RpcRequest::GetEpochSchedule => "getEpochSchedule",
             RpcRequest::GetGenesisHash => "getGenesisHash",
+            RpcRequest::GetIdentity => "getIdentity",
             RpcRequest::GetInflation => "getInflation",
             RpcRequest::GetLeaderSchedule => "getLeaderSchedule",
             RpcRequest::GetNumBlocksSinceSignatureConfirmation => {
@@ -61,6 +66,8 @@ impl RpcRequest {
             }
             RpcRequest::GetProgramAccounts => "getProgramAccounts",
             RpcRequest::GetRecentBlockhash => "getRecentBlockhash",
+            RpcRequest::GetFeeCalculatorForBlockhash => "getFeeCalculatorForBlockhash",
+            RpcRequest::GetFeeRateGovernor => "getFeeRateGovernor",
             RpcRequest::GetSignatureStatus => "getSignatureStatus",
             RpcRequest::GetSlot => "getSlot",
             RpcRequest::GetSlotLeader => "getSlotLeader",
@@ -68,6 +75,7 @@ impl RpcRequest {
             RpcRequest::GetStorageTurnRate => "getStorageTurnRate",
             RpcRequest::GetSlotsPerSegment => "getSlotsPerSegment",
             RpcRequest::GetStoragePubkeysForSlot => "getStoragePubkeysForSlot",
+            RpcRequest::GetTotalSupply => "getTotalSupply",
             RpcRequest::GetTransactionCount => "getTransactionCount",
             RpcRequest::GetVersion => "getVersion",
             RpcRequest::GetVoteAccounts => "getVoteAccounts",
@@ -123,7 +131,7 @@ mod tests {
         assert_eq!(request["params"], json!([addr]));
 
         let test_request = RpcRequest::GetBalance;
-        let request = test_request.build_request_json(1, json!([addr]));
+        let request = test_request.build_request_json(1, json!([addr.clone()]));
         assert_eq!(request["method"], "getBalance");
 
         let test_request = RpcRequest::GetEpochInfo;
@@ -137,6 +145,14 @@ mod tests {
         let test_request = RpcRequest::GetRecentBlockhash;
         let request = test_request.build_request_json(1, Value::Null);
         assert_eq!(request["method"], "getRecentBlockhash");
+
+        let test_request = RpcRequest::GetFeeCalculatorForBlockhash;
+        let request = test_request.build_request_json(1, json!([addr.clone()]));
+        assert_eq!(request["method"], "getFeeCalculatorForBlockhash");
+
+        let test_request = RpcRequest::GetFeeRateGovernor;
+        let request = test_request.build_request_json(1, Value::Null);
+        assert_eq!(request["method"], "getFeeRateGovernor");
 
         let test_request = RpcRequest::GetSlot;
         let request = test_request.build_request_json(1, Value::Null);

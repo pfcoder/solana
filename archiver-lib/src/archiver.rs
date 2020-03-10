@@ -47,7 +47,7 @@ use solana_storage_program::{
 };
 use std::{
     io::{self, ErrorKind},
-    net::{SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     result,
     sync::atomic::{AtomicBool, Ordering},
@@ -211,12 +211,9 @@ impl Archiver {
         let client = solana_core::gossip_service::get_client(&nodes);
 
         info!("Setting up mining account...");
-        if let Err(e) = Self::setup_mining_account(
-            &client,
-            &keypair,
-            &storage_keypair,
-            client_commitment.clone(),
-        ) {
+        if let Err(e) =
+            Self::setup_mining_account(&client, &keypair, &storage_keypair, client_commitment)
+        {
             //shutdown services before exiting
             exit.store(true, Ordering::Relaxed);
             gossip_service.join()?;
@@ -358,7 +355,7 @@ impl Archiver {
                 &cluster_info,
                 archiver_keypair,
                 storage_keypair,
-                meta.client_commitment.clone(),
+                meta.client_commitment,
             );
         }
         exit.store(true, Ordering::Relaxed);
@@ -374,7 +371,7 @@ impl Archiver {
         let client = solana_core::gossip_service::get_client(&nodes);
 
         if let Ok(Some(account)) =
-            client.get_account_with_commitment(&storage_keypair.pubkey(), client_commitment.clone())
+            client.get_account_with_commitment(&storage_keypair.pubkey(), client_commitment)
         {
             if let Ok(StorageContract::ArchiverStorage { validations, .. }) = account.state() {
                 if !validations.is_empty() {
@@ -415,7 +412,7 @@ impl Archiver {
         slot_sender: Sender<u64>,
     ) -> Result<WindowService> {
         let slots_per_segment =
-            match Self::get_segment_config(&cluster_info, meta.client_commitment.clone()) {
+            match Self::get_segment_config(&cluster_info, meta.client_commitment) {
                 Ok(slots_per_segment) => slots_per_segment,
                 Err(e) => {
                     error!("unable to get segment size configuration, exiting...");
@@ -581,7 +578,7 @@ impl Archiver {
             &keypair.pubkey(),
             &Duration::from_millis(100),
             &Duration::from_secs(5),
-            client_commitment.clone(),
+            client_commitment,
         )? == 0
         {
             return Err(ArchiverError::EmptyStorageAccountBalance);
@@ -589,16 +586,15 @@ impl Archiver {
 
         info!("checking storage account keypair...");
         // check if the storage account exists
-        let balance = client
-            .poll_get_balance_with_commitment(&storage_keypair.pubkey(), client_commitment.clone());
+        let balance =
+            client.poll_get_balance_with_commitment(&storage_keypair.pubkey(), client_commitment);
         if balance.is_err() || balance.unwrap() == 0 {
-            let blockhash =
-                match client.get_recent_blockhash_with_commitment(client_commitment.clone()) {
-                    Ok((blockhash, _)) => blockhash,
-                    Err(e) => {
-                        return Err(ArchiverError::TransportError(e));
-                    }
-                };
+            let blockhash = match client.get_recent_blockhash_with_commitment(client_commitment) {
+                Ok((blockhash, _)) => blockhash,
+                Err(e) => {
+                    return Err(ArchiverError::TransportError(e));
+                }
+            };
 
             let ix = storage_instruction::create_storage_account(
                 &keypair.pubkey(),
@@ -631,32 +627,27 @@ impl Archiver {
         // No point if we've got no storage account...
         let nodes = cluster_info.read().unwrap().tvu_peers();
         let client = solana_core::gossip_service::get_client(&nodes);
-        let storage_balance = client.poll_get_balance_with_commitment(
-            &storage_keypair.pubkey(),
-            meta.client_commitment.clone(),
-        );
+        let storage_balance = client
+            .poll_get_balance_with_commitment(&storage_keypair.pubkey(), meta.client_commitment);
         if storage_balance.is_err() || storage_balance.unwrap() == 0 {
             error!("Unable to submit mining proof, no storage account");
             return;
         }
         // ...or no lamports for fees
-        let balance = client.poll_get_balance_with_commitment(
-            &archiver_keypair.pubkey(),
-            meta.client_commitment.clone(),
-        );
+        let balance = client
+            .poll_get_balance_with_commitment(&archiver_keypair.pubkey(), meta.client_commitment);
         if balance.is_err() || balance.unwrap() == 0 {
             error!("Unable to submit mining proof, insufficient Archiver Account balance");
             return;
         }
 
-        let blockhash =
-            match client.get_recent_blockhash_with_commitment(meta.client_commitment.clone()) {
-                Ok((blockhash, _)) => blockhash,
-                Err(_) => {
-                    error!("unable to get recent blockhash, can't submit proof");
-                    return;
-                }
-            };
+        let blockhash = match client.get_recent_blockhash_with_commitment(meta.client_commitment) {
+            Ok((blockhash, _)) => blockhash,
+            Err(_) => {
+                error!("unable to get recent blockhash, can't submit proof");
+                return;
+            }
+        };
         let instruction = storage_instruction::mining_proof(
             &storage_keypair.pubkey(),
             meta.sha_state,
@@ -813,14 +804,15 @@ impl Archiver {
         blockstore: &Arc<Blockstore>,
         slots_per_segment: u64,
     ) -> Result<u64> {
+        let ip_addr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
         // Create a client which downloads from the archiver and see that it
         // can respond with shreds.
-        let start_slot = Self::get_archiver_segment_slot(archiver_info.storage_addr);
+        let start_slot = Self::get_archiver_segment_slot(ip_addr, archiver_info.storage_addr);
         info!("Archiver download: start at {}", start_slot);
 
         let exit = Arc::new(AtomicBool::new(false));
         let (s_reader, r_reader) = channel();
-        let repair_socket = Arc::new(bind_in_range(VALIDATOR_PORT_RANGE).unwrap().1);
+        let repair_socket = Arc::new(bind_in_range(ip_addr, VALIDATOR_PORT_RANGE).unwrap().1);
         let t_receiver = receiver(
             repair_socket.clone(),
             &exit,
@@ -917,8 +909,8 @@ impl Archiver {
         true
     }
 
-    fn get_archiver_segment_slot(to: SocketAddr) -> u64 {
-        let (_port, socket) = bind_in_range(VALIDATOR_PORT_RANGE).unwrap();
+    fn get_archiver_segment_slot(bind_ip_addr: IpAddr, to: SocketAddr) -> u64 {
+        let (_port, socket) = bind_in_range(bind_ip_addr, VALIDATOR_PORT_RANGE).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();

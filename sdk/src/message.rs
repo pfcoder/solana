@@ -7,6 +7,7 @@ use crate::{
     short_vec, system_instruction,
 };
 use itertools::Itertools;
+use std::convert::TryFrom;
 
 fn position(keys: &[Pubkey], key: &Pubkey) -> u8 {
     keys.iter().position(|k| k == key).unwrap() as u8
@@ -233,6 +234,17 @@ impl Message {
             .collect()
     }
 
+    pub fn is_key_passed_to_program(&self, index: usize) -> bool {
+        if let Ok(index) = u8::try_from(index) {
+            for ix in self.instructions.iter() {
+                if ix.accounts.contains(&index) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn program_position(&self, index: usize) -> Option<usize> {
         let program_ids = self.program_ids();
         program_ids
@@ -246,6 +258,10 @@ impl Message {
             || (i >= self.header.num_required_signatures as usize
                 && i < self.account_keys.len()
                     - self.header.num_readonly_unsigned_accounts as usize)
+    }
+
+    pub fn is_signer(&self, i: usize) -> bool {
+        i < self.header.num_required_signatures as usize
     }
 
     pub fn get_account_keys_by_lock_type(&self) -> (Vec<&Pubkey>, Vec<&Pubkey>) {

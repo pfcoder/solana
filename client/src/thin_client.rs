@@ -11,7 +11,7 @@ use solana_sdk::{
     client::{AsyncClient, Client, SyncClient},
     clock::MAX_PROCESSING_AGE,
     commitment_config::CommitmentConfig,
-    fee_calculator::FeeCalculator,
+    fee_calculator::{FeeCalculator, FeeRateGovernor},
     hash::Hash,
     instruction::Instruction,
     message::Message,
@@ -26,7 +26,7 @@ use solana_sdk::{
 };
 use std::{
     io,
-    net::{SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         RwLock,
@@ -445,6 +445,21 @@ impl SyncClient for ThinClient {
         }
     }
 
+    fn get_fee_calculator_for_blockhash(
+        &self,
+        blockhash: &Hash,
+    ) -> TransportResult<Option<FeeCalculator>> {
+        let fee_calculator = self
+            .rpc_client()
+            .get_fee_calculator_for_blockhash(blockhash)?;
+        Ok(fee_calculator)
+    }
+
+    fn get_fee_rate_governor(&self) -> TransportResult<FeeRateGovernor> {
+        let fee_rate_governor = self.rpc_client().get_fee_rate_governor()?;
+        Ok(fee_rate_governor.value)
+    }
+
     fn get_signature_status(
         &self,
         signature: &Signature,
@@ -598,7 +613,8 @@ impl AsyncClient for ThinClient {
 }
 
 pub fn create_client((rpc, tpu): (SocketAddr, SocketAddr), range: (u16, u16)) -> ThinClient {
-    let (_, transactions_socket) = solana_net_utils::bind_in_range(range).unwrap();
+    let (_, transactions_socket) =
+        solana_net_utils::bind_in_range(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), range).unwrap();
     ThinClient::new(rpc, tpu, transactions_socket)
 }
 
@@ -607,7 +623,8 @@ pub fn create_client_with_timeout(
     range: (u16, u16),
     timeout: Duration,
 ) -> ThinClient {
-    let (_, transactions_socket) = solana_net_utils::bind_in_range(range).unwrap();
+    let (_, transactions_socket) =
+        solana_net_utils::bind_in_range(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), range).unwrap();
     ThinClient::new_socket_with_timeout(rpc, tpu, transactions_socket, timeout)
 }
 

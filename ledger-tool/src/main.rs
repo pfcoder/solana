@@ -4,6 +4,7 @@ use clap::{
 };
 use histogram;
 use serde_json::json;
+use solana_clap_utils::input_validators::is_slot;
 use solana_ledger::{
     bank_forks::{BankForks, SnapshotConfig},
     bank_forks_utils,
@@ -60,7 +61,7 @@ fn output_slot(blockstore: &Blockstore, slot: Slot, method: &LedgerOutputMethod)
                     for (signature_index, signature) in transaction.signatures.iter().enumerate() {
                         println!("      Signature {}: {:?}", signature_index, signature);
                     }
-                    println!("      Header: {:?}", message.header);
+                    println!("      {:?}", message.header);
                     for (account_index, account) in message.account_keys.iter().enumerate() {
                         println!("      Account {}: {:?}", account_index, account);
                     }
@@ -576,11 +577,13 @@ fn main() {
     let halt_at_slot_arg = Arg::with_name("halt_at_slot")
         .long("halt-at-slot")
         .value_name("SLOT")
+        .validator(is_slot)
         .takes_value(true)
         .help("Halt processing at the given slot");
     let hard_forks_arg = Arg::with_name("hard_forks")
         .long("hard-fork")
         .value_name("SLOT")
+        .validator(is_slot)
         .multiple(true)
         .takes_value(true)
         .help("Add a hard fork at this slot");
@@ -609,6 +612,7 @@ fn main() {
                 Arg::with_name("slots")
                     .index(1)
                     .value_name("SLOTS")
+                    .validator(is_slot)
                     .takes_value(true)
                     .multiple(true)
                     .required(true)
@@ -685,6 +689,7 @@ fn main() {
                 Arg::with_name("snapshot_slot")
                     .index(1)
                     .value_name("SLOT")
+                    .validator(is_slot)
                     .takes_value(true)
                     .help("Slot at which to create the snapshot"),
             )
@@ -712,6 +717,24 @@ fn main() {
                     .takes_value(true)
                     .required(true)
                     .help("The location of the YAML file with a list of rollback slot heights and hashes"),
+            )
+        ).subcommand(
+            SubCommand::with_name("purge")
+            .about("Purge the ledger at the block height")
+            .arg(
+                Arg::with_name("start_slot")
+                    .index(1)
+                    .value_name("SLOT")
+                    .takes_value(true)
+                    .required(true)
+                    .help("Start slot to purge from."),
+            )
+            .arg(
+                Arg::with_name("end_slot")
+                    .index(2)
+                    .value_name("SLOT")
+                    .takes_value(true)
+                    .help("Optional ending slot to stop purging."),
             )
         )
         .subcommand(
@@ -993,6 +1016,13 @@ fn main() {
                 }
             }
         }
+        ("purge", Some(arg_matches)) => {
+            let start_slot = value_t_or_exit!(arg_matches, "start_slot", Slot);
+            let end_slot = value_t!(arg_matches, "end_slot", Slot);
+            let end_slot = end_slot.map_or(None, Some);
+            let blockstore = open_blockstore(&ledger_path);
+            blockstore.purge_slots(start_slot, end_slot);
+        }
         ("prune", Some(arg_matches)) => {
             if let Some(prune_file_path) = arg_matches.value_of("slot_list") {
                 let blockstore = open_blockstore(&ledger_path);
@@ -1088,20 +1118,19 @@ fn main() {
                 Ok(metas) => {
                     let all = arg_matches.is_present("all");
 
-                    println!("Collecting Ledger information...");
                     let slots: Vec<_> = metas.map(|(slot, _)| slot).collect();
                     if slots.is_empty() {
-                        println!("Ledger is empty. No slots found.");
+                        println!("Ledger is empty");
                     } else {
                         let first = slots.first().unwrap();
                         let last = slots.last().unwrap_or_else(|| first);
                         if first != last {
-                            println!("Ledger contains data from slots {:?} to {:?}", first, last);
+                            println!("Ledger has data for slots {:?} to {:?}", first, last);
                             if all {
                                 println!("Non-empty slots: {:?}", slots);
                             }
                         } else {
-                            println!("Ledger only contains some data for slot {:?}", first);
+                            println!("Ledger has data for slot {:?}", first);
                         }
                     }
                 }

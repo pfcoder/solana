@@ -10,7 +10,11 @@ use jsonrpc_http_server::{
     RequestMiddlewareAction, ServerBuilder,
 };
 use regex::Regex;
-use solana_ledger::{bank_forks::BankForks, blockstore::Blockstore};
+use solana_ledger::{
+    bank_forks::{BankForks, SnapshotConfig},
+    blockstore::Blockstore,
+    snapshot_utils,
+};
 use solana_sdk::hash::Hash;
 use std::{
     net::SocketAddr,
@@ -32,14 +36,25 @@ pub struct JsonRpcService {
 struct RpcRequestMiddleware {
     ledger_path: PathBuf,
     snapshot_archive_path_regex: Regex,
+    snapshot_config: Option<SnapshotConfig>,
 }
+
 impl RpcRequestMiddleware {
-    pub fn new(ledger_path: PathBuf) -> Self {
+    pub fn new(ledger_path: PathBuf, snapshot_config: Option<SnapshotConfig>) -> Self {
         Self {
             ledger_path,
             snapshot_archive_path_regex: Regex::new(r"/snapshot-\d+-[[:alnum:]]+\.tar\.bz2$")
                 .unwrap(),
+            snapshot_config,
         }
+    }
+
+    fn redirect(location: &str) -> hyper::Response<hyper::Body> {
+        hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(hyper::header::LOCATION, location)
+            .body(hyper::Body::from(String::from(location)))
+            .unwrap()
     }
 
     fn not_found() -> hyper::Response<hyper::Body> {
@@ -59,14 +74,30 @@ impl RpcRequestMiddleware {
     fn is_get_path(&self, path: &str) -> bool {
         match path {
             "/genesis.tar.bz2" => true,
-            _ => self.snapshot_archive_path_regex.is_match(path),
+            _ => {
+                if self.snapshot_config.is_some() {
+                    self.snapshot_archive_path_regex.is_match(path)
+                } else {
+                    false
+                }
+            }
         }
     }
 
     fn get(&self, path: &str) -> RequestMiddlewareAction {
-        let filename = self.ledger_path.join(
-            path.split_at(1).1, // Drop leading '/' from path
-        );
+        let stem = path.split_at(1).1; // Drop leading '/' from path
+        let filename = {
+            match path {
+                "/genesis.tar.bz2" => self.ledger_path.join(stem),
+                _ => self
+                    .snapshot_config
+                    .as_ref()
+                    .unwrap()
+                    .snapshot_package_output_path
+                    .join(stem),
+            }
+        };
+
         info!("get {} -> {:?}", path, filename);
 
         RequestMiddlewareAction::Respond {
@@ -89,6 +120,32 @@ impl RequestMiddleware for RpcRequestMiddleware {
     fn on_request(&self, request: hyper::Request<hyper::Body>) -> RequestMiddlewareAction {
         trace!("request uri: {}", request.uri());
 
+        if let Some(ref snapshot_config) = self.snapshot_config {
+            if request.uri().path() == "/snapshot.tar.bz2" {
+                // Convenience redirect to the latest snapshot
+                return RequestMiddlewareAction::Respond {
+                    should_validate_hosts: true,
+                    response: Box::new(jsonrpc_core::futures::future::ok(
+                        if let Some((snapshot_archive, _)) =
+                            snapshot_utils::get_highest_snapshot_archive_path(
+                                &snapshot_config.snapshot_package_output_path,
+                            )
+                        {
+                            RpcRequestMiddleware::redirect(&format!(
+                                "/{}",
+                                snapshot_archive
+                                    .file_name()
+                                    .unwrap_or_else(|| std::ffi::OsStr::new(""))
+                                    .to_str()
+                                    .unwrap_or(&"")
+                            ))
+                        } else {
+                            RpcRequestMiddleware::not_found()
+                        },
+                    )),
+                };
+            }
+        }
         if self.is_get_path(request.uri().path()) {
             self.get(request.uri().path())
         } else {
@@ -105,6 +162,7 @@ impl JsonRpcService {
     pub fn new(
         rpc_addr: SocketAddr,
         config: JsonRpcConfig,
+        snapshot_config: Option<SnapshotConfig>,
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         blockstore: Arc<Blockstore>,
@@ -148,7 +206,7 @@ impl JsonRpcService {
                             AccessControlAllowOrigin::Any,
                         ]))
                         .cors_max_age(86400)
-                        .request_middleware(RpcRequestMiddleware::new(ledger_path))
+                        .request_middleware(RpcRequestMiddleware::new(ledger_path, snapshot_config))
                         .start_http(&rpc_addr);
                 if let Err(e) = server {
                     warn!("JSON RPC service unavailable error: {:?}. \nAlso, check that port {} is not already in use by another application", e, rpc_addr.port());
@@ -214,9 +272,10 @@ mod tests {
         let cluster_info = Arc::new(RwLock::new(ClusterInfo::new_with_invalid_keypair(
             ContactInfo::default(),
         )));
+        let ip_addr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
         let rpc_addr = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-            solana_net_utils::find_available_port_in_range((10000, 65535)).unwrap(),
+            ip_addr,
+            solana_net_utils::find_available_port_in_range(ip_addr, (10000, 65535)).unwrap(),
         );
         let bank_forks = Arc::new(RwLock::new(BankForks::new(bank.slot(), bank)));
         let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
@@ -225,6 +284,7 @@ mod tests {
         let mut rpc_service = JsonRpcService::new(
             rpc_addr,
             JsonRpcConfig::default(),
+            None,
             bank_forks,
             block_commitment_cache,
             Arc::new(blockstore),
@@ -253,16 +313,27 @@ mod tests {
 
     #[test]
     fn test_is_get_path() {
-        let rrm = RpcRequestMiddleware::new(PathBuf::from("/"));
+        let rrm = RpcRequestMiddleware::new(PathBuf::from("/"), None);
+        let rrm_with_snapshot_config = RpcRequestMiddleware::new(
+            PathBuf::from("/"),
+            Some(SnapshotConfig {
+                snapshot_interval_slots: 0,
+                snapshot_package_output_path: PathBuf::from("/"),
+                snapshot_path: PathBuf::from("/"),
+            }),
+        );
 
         assert!(rrm.is_get_path("/genesis.tar.bz2"));
         assert!(!rrm.is_get_path("genesis.tar.bz2"));
 
-        assert!(!rrm.is_get_path("/snapshot.tar.bz2"));
+        assert!(!rrm.is_get_path("/snapshot.tar.bz2")); // This is a redirect
 
         assert!(
-            rrm.is_get_path("/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2")
+            !rrm.is_get_path("/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2")
         );
+        assert!(rrm_with_snapshot_config
+            .is_get_path("/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"));
+
         assert!(!rrm.is_get_path(
             "/snapshot-notaslotnumber-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
         ));

@@ -190,7 +190,9 @@ impl LedgerWallet {
         #[allow(clippy::match_overlapping_arm)]
         match status {
             // These need to be aligned with solana Ledger app error codes, and clippy allowance removed
-            0x6700 => Err(RemoteWalletError::Protocol("Incorrect length")),
+            0x6700 => Err(RemoteWalletError::Protocol(
+                "Solana app not open on Ledger device",
+            )),
             0x6802 => Err(RemoteWalletError::Protocol("Invalid parameter")),
             0x6803 => Err(RemoteWalletError::Protocol(
                 "Overflow: message longer than MAX_MESSAGE_LENGTH",
@@ -225,7 +227,7 @@ impl LedgerWallet {
         data: &[u8],
     ) -> Result<Vec<u8>, RemoteWalletError> {
         self.write(command, p1, p2, data)?;
-        if p1 == P1_CONFIRM {
+        if p1 == P1_CONFIRM && is_last_part(p2) {
             println!("Waiting for remote wallet to approve...");
         }
         self.read()
@@ -247,31 +249,37 @@ impl LedgerWallet {
 impl RemoteWallet for LedgerWallet {
     fn read_device(
         &self,
-        dev_info: &hidapi::HidDeviceInfo,
+        dev_info: &hidapi::DeviceInfo,
     ) -> Result<RemoteWalletInfo, RemoteWalletError> {
         let manufacturer = dev_info
-            .manufacturer_string
+            .manufacturer_string()
             .clone()
-            .unwrap_or_else(|| "Unknown".to_owned())
+            .unwrap_or("Unknown")
             .to_lowercase()
             .replace(" ", "-");
         let model = dev_info
-            .product_string
+            .product_string()
             .clone()
-            .unwrap_or_else(|| "Unknown".to_owned())
+            .unwrap_or("Unknown")
             .to_lowercase()
             .replace(" ", "-");
         let serial = dev_info
-            .serial_number
+            .serial_number()
             .clone()
-            .unwrap_or_else(|| "Unknown".to_owned());
-        self.get_pubkey(&DerivationPath::default(), false)
-            .map(|pubkey| RemoteWalletInfo {
-                model,
-                manufacturer,
-                serial,
-                pubkey,
-            })
+            .unwrap_or("Unknown")
+            .to_string();
+        let pubkey_result = self.get_pubkey(&DerivationPath::default(), false);
+        let (pubkey, error) = match pubkey_result {
+            Ok(pubkey) => (pubkey, None),
+            Err(err) => (Pubkey::default(), Some(err)),
+        };
+        Ok(RemoteWalletInfo {
+            model,
+            manufacturer,
+            serial,
+            pubkey,
+            error,
+        })
     }
 
     fn get_pubkey(
@@ -395,12 +403,24 @@ fn extend_and_serialize(derivation_path: &DerivationPath) -> Vec<u8> {
 /// Choose a Ledger wallet based on matching info fields
 pub fn get_ledger_from_info(
     info: RemoteWalletInfo,
+    keypair_name: &str,
     wallet_manager: &RemoteWalletManager,
 ) -> Result<Arc<LedgerWallet>, RemoteWalletError> {
     let devices = wallet_manager.list_devices();
-    let (pubkeys, device_paths): (Vec<Pubkey>, Vec<String>) = devices
+    let mut matches = devices
         .iter()
-        .filter(|&device_info| device_info.matches(&info))
+        .filter(|&device_info| device_info.matches(&info));
+    if matches
+        .clone()
+        .all(|device_info| device_info.error.is_some())
+    {
+        let first_device = matches.next();
+        if let Some(device) = first_device {
+            return Err(device.error.clone().unwrap());
+        }
+    }
+    let (pubkeys, device_paths): (Vec<Pubkey>, Vec<String>) = matches
+        .filter(|&device_info| device_info.error.is_none())
         .map(|device_info| (device_info.pubkey, device_info.get_pretty_path()))
         .unzip();
     if pubkeys.is_empty() {
@@ -408,7 +428,10 @@ pub fn get_ledger_from_info(
     }
     let wallet_base_pubkey = if pubkeys.len() > 1 {
         let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Multiple hardware wallets found. Please select a device")
+            .with_prompt(&format!(
+                "Multiple hardware wallets found. Please select a device for {:?}",
+                keypair_name
+            ))
             .default(0)
             .items(&device_paths[..])
             .interact()
@@ -418,4 +441,38 @@ pub fn get_ledger_from_info(
         pubkeys[0]
     };
     wallet_manager.get_ledger(&wallet_base_pubkey)
+}
+
+//
+fn is_last_part(p2: u8) -> bool {
+    p2 & P2_MORE == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_last_part() {
+        // Bytes with bit-2 set to 0 should return true
+        assert!(is_last_part(0b00));
+        assert!(is_last_part(0b01));
+        assert!(is_last_part(0b101));
+        assert!(is_last_part(0b1001));
+        assert!(is_last_part(0b1101));
+
+        // Bytes with bit-2 set to 1 should return false
+        assert!(!is_last_part(0b10));
+        assert!(!is_last_part(0b11));
+        assert!(!is_last_part(0b110));
+        assert!(!is_last_part(0b111));
+        assert!(!is_last_part(0b1010));
+
+        // Test implementation-specific uses
+        let p2 = 0;
+        assert!(is_last_part(p2));
+        let p2 = P2_EXTEND | P2_MORE;
+        assert!(!is_last_part(p2));
+        assert!(is_last_part(p2 & !P2_MORE));
+    }
 }

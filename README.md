@@ -9,60 +9,7 @@ Blockchain Rebuilt for Scale
 Solana&trade; is a new blockchain architecture built from the ground up for scale. The architecture supports
 up to 710 thousand transactions per second on a gigabit network.
 
-Disclaimer
-===
-
-All claims, content, designs, algorithms, estimates, roadmaps, specifications, and performance measurements described in this project are done with the author's best effort.  It is up to the reader to check and validate their accuracy and truthfulness.  Furthermore nothing in this project constitutes a solicitation for investment.
-
-Introduction
-===
-
-It's possible for a centralized database to process 710,000 transactions per second on a standard gigabit network if the transactions are, on average, no more than 176 bytes. A centralized database can also replicate itself and maintain high availability without significantly compromising that transaction rate using the distributed system technique known as Optimistic Concurrency Control [\[H.T.Kung, J.T.Robinson (1981)\]](http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.65.4735). At Solana, we're demonstrating that these same theoretical limits apply just as well to blockchain on an adversarial network. The key ingredient? Finding a way to share time when nodes can't trust one-another. Once nodes can trust time, suddenly ~40 years of distributed systems research becomes applicable to blockchain!
-
-> Perhaps the most striking difference between algorithms obtained by our method and ones based upon timeout is that using timeout produces a traditional distributed algorithm in which the processes operate asynchronously, while our method produces a globally synchronous one in which every process does the same thing at (approximately) the same time. Our method seems to contradict the whole purpose of distributed processing, which is to permit different processes to operate independently and perform different functions. However, if a distributed system is really a single system, then the processes must be synchronized in some way. Conceptually, the easiest way to synchronize processes is to get them all to do the same thing at the same time. Therefore, our method is used to implement a kernel that performs the necessary synchronization--for example, making sure that two different processes do not try to modify a file at the same time. Processes might spend only a small fraction of their time executing the synchronizing kernel; the rest of the time, they can operate independently--e.g., accessing different files. This is an approach we have advocated even when fault-tolerance is not required. The method's basic simplicity makes it easier to understand the precise properties of a system, which is crucial if one is to know just how fault-tolerant the system is. [\[L.Lamport (1984)\]](http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.71.1078)
-
-Furthermore, and much to our surprise, it can be implemented using a mechanism that has existed in Bitcoin since day one. The Bitcoin feature is called nLocktime and it can be used to postdate transactions using block height instead of a timestamp. As a Bitcoin client, you'd use block height instead of a timestamp if you don't trust the network. Block height turns out to be an instance of what's being called a Verifiable Delay Function in cryptography circles. It's a cryptographically secure way to say time has passed. In Solana, we use a far more granular verifiable delay function, a SHA 256 hash chain, to checkpoint the ledger and coordinate consensus. With it, we implement Optimistic Concurrency Control and are now well en route towards that theoretical limit of 710,000 transactions per second.
-
-Documentation
-===
-
-Before you jump into the code, review the documentation [Solana: Blockchain Rebuilt for Scale](https://docs.solana.com).
-
-(The _latest_ development version of the docs is [available here](https://docs.solana.com/v/master).)
-
-Release Binaries
-===
-Official release binaries are available at [Github Releases](https://github.com/solana-labs/solana/releases).
-
-Additionally we provide pre-release binaries for the latest code on the edge and
-beta channels.  Note that these pre-release binaries may be less stable than an
-official release.
-
-### Edge channel
-#### Linux (x86_64-unknown-linux-gnu)
-* [solana.tar.bz2](http://release.solana.com/edge/solana-release-x86_64-unknown-linux-gnu.tar.bz2)
-* [solana-install-init](http://release.solana.com/edge/solana-install-init-x86_64-unknown-linux-gnu) as a stand-alone executable
-#### mac OS (x86_64-apple-darwin)
-* [solana.tar.bz2](http://release.solana.com/edge/solana-release-x86_64-apple-darwin.tar.bz2)
-* [solana-install-init](http://release.solana.com/edge/solana-install-init-x86_64-apple-darwin) as a stand-alone executable
-#### Windows (x86_64-pc-windows-msvc)
-* [solana.tar.bz2](http://release.solana.com/edge/solana-release-x86_64-pc-windows-msvc.tar.bz2)
-* [solana-install-init.exe](http://release.solana.com/edge/solana-install-init-x86_64-pc-windows-msvc.exe) as a stand-alone executable
-#### All platforms
-* [solana-metrics.tar.bz2](http://release.solana.com.s3.amazonaws.com/edge/solana-metrics.tar.bz2)
-
-### Beta channel
-#### Linux (x86_64-unknown-linux-gnu)
-* [solana.tar.bz2](http://release.solana.com/beta/solana-release-x86_64-unknown-linux-gnu.tar.bz2)
-* [solana-install-init](http://release.solana.com/beta/solana-install-init-x86_64-unknown-linux-gnu) as a stand-alone executable
-#### mac OS (x86_64-apple-darwin)
-* [solana.tar.bz2](http://release.solana.com/beta/solana-release-x86_64-apple-darwin.tar.bz2)
-* [solana-install-init](http://release.solana.com/beta/solana-install-init-x86_64-apple-darwin) as a stand-alone executable
-#### Windows (x86_64-pc-windows-msvc)
-* [solana.tar.bz2](http://release.solana.com/beta/solana-release-x86_64-pc-windows-msvc.tar.bz2)
-* [solana-install-init.exe](http://release.solana.com/beta/solana-install-init-x86_64-pc-windows-msvc.exe) as a stand-alone executable
-#### All platforms
-* [solana-metrics.tar.bz2](http://release.solana.com.s3.amazonaws.com/beta/solana-metrics.tar.bz2)
+Read all about it at [Solana: Blockchain Rebuilt for Scale](https://docs.solana.com/v/master).
 
 Developing
 ===
@@ -238,3 +185,8 @@ problem is solved by this code?" On the other hand, if a test does fail and you 
 better way to solve the same problem, a Pull Request with your solution would most certainly be
 welcome! Likewise, if rewriting a test can better communicate what code it's protecting, please
 send us that patch!
+
+Disclaimer
+===
+
+All claims, content, designs, algorithms, estimates, roadmaps, specifications, and performance measurements described in this project are done with the author's best effort.  It is up to the reader to check and validate their accuracy and truthfulness.  Furthermore nothing in this project constitutes a solicitation for investment.

@@ -66,6 +66,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --expected-genesis-hash ]]; then
       args+=("$1" "$2")
       shift 2
+    elif [[ $1 = --expected-shred-version ]]; then
+      args+=("$1" "$2")
+      shift 2
     elif [[ $1 = --identity-keypair ]]; then
       identity_keypair_path=$2
       args+=("$1" "$2")
@@ -216,6 +219,8 @@ default_arg --voting-keypair "$voting_keypair_path"
 default_arg --storage-keypair "$storage_keypair_path"
 default_arg --ledger "$ledger_dir"
 default_arg --log -
+default_arg --enable-rpc-exit
+default_arg --enable-rpc-set-log-filter
 
 if [[ -n $SOLANA_CUDA ]]; then
   program=$solana_validator_cuda

@@ -19,20 +19,13 @@ pull_request_rules:
       label:
         add:
           - automerge
-  - name: v0.23 backport
-    conditions:
-      - base=master
-      - label=v0.23
-    actions:
-      backport:
-        branches:
-          - v0.23
   - name: v1.0 backport
     conditions:
       - base=master
       - label=v1.0
     actions:
       backport:
+        ignore_conflicts: true
         branches:
           - v1.0
   - name: v1.1 backport
@@ -41,6 +34,7 @@ pull_request_rules:
       - label=v1.1
     actions:
       backport:
+        ignore_conflicts: true
         branches:
           - v1.1
   - name: v1.2 backport
@@ -49,5 +43,6 @@ pull_request_rules:
       - label=v1.2
     actions:
       backport:
+        ignore_conflicts: true
         branches:
           - v1.2

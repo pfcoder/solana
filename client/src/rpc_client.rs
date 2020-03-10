@@ -6,8 +6,8 @@ use crate::{
     rpc_request::RpcRequest,
     rpc_response::{
         Response, RpcAccount, RpcBlockhashFeeCalculator, RpcConfirmedBlock, RpcContactInfo,
-        RpcEpochInfo, RpcKeyedAccount, RpcLeaderSchedule, RpcResponse, RpcVersionInfo,
-        RpcVoteAccountStatus,
+        RpcEpochInfo, RpcFeeCalculator, RpcFeeRateGovernor, RpcIdentity, RpcKeyedAccount,
+        RpcLeaderSchedule, RpcResponse, RpcVersionInfo, RpcVoteAccountStatus,
     },
 };
 use bincode::serialize;
@@ -18,7 +18,7 @@ use solana_sdk::{
     clock::{Slot, UnixTimestamp, DEFAULT_TICKS_PER_SECOND, DEFAULT_TICKS_PER_SLOT},
     commitment_config::CommitmentConfig,
     epoch_schedule::EpochSchedule,
-    fee_calculator::FeeCalculator,
+    fee_calculator::{FeeCalculator, FeeRateGovernor},
     hash::Hash,
     inflation::Inflation,
     pubkey::Pubkey,
@@ -164,10 +164,43 @@ impl RpcClient {
         })
     }
 
-    pub fn get_vote_accounts(&self) -> io::Result<RpcVoteAccountStatus> {
+    pub fn total_supply(&self) -> io::Result<u64> {
+        self.total_supply_with_commitment(CommitmentConfig::default())
+    }
+
+    pub fn total_supply_with_commitment(
+        &self,
+        commitment_config: CommitmentConfig,
+    ) -> io::Result<u64> {
         let response = self
             .client
-            .send(&RpcRequest::GetVoteAccounts, Value::Null, 0)
+            .send(&RpcRequest::GetTotalSupply, json!([commitment_config]), 0)
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("GetTotalSupply request failure: {:?}", err),
+                )
+            })?;
+
+        serde_json::from_value(response).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("GetTotalSupply parse failure: {}", err),
+            )
+        })
+    }
+
+    pub fn get_vote_accounts(&self) -> io::Result<RpcVoteAccountStatus> {
+        self.get_vote_accounts_with_commitment(CommitmentConfig::default())
+    }
+
+    pub fn get_vote_accounts_with_commitment(
+        &self,
+        commitment_config: CommitmentConfig,
+    ) -> io::Result<RpcVoteAccountStatus> {
+        let response = self
+            .client
+            .send(&RpcRequest::GetVoteAccounts, json!([commitment_config]), 0)
             .map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::Other,
@@ -347,6 +380,34 @@ impl RpcClient {
                 format!("GetEpochSchedule parse failure: {:?}", err),
             )
         })
+    }
+
+    pub fn get_identity(&self) -> io::Result<Pubkey> {
+        let response = self
+            .client
+            .send(&RpcRequest::GetIdentity, Value::Null, 0)
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("GetIdentity request failure: {:?}", err),
+                )
+            })?;
+
+        serde_json::from_value(response)
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("GetIdentity failure: {:?}", err),
+                )
+            })
+            .and_then(|rpc_identity: RpcIdentity| {
+                rpc_identity.identity.parse::<Pubkey>().map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("GetIdentity invalid pubkey failure: {:?}", err),
+                    )
+                })
+            })
     }
 
     pub fn get_inflation(&self) -> io::Result<Inflation> {
@@ -801,6 +862,60 @@ impl RpcClient {
         Ok(Response {
             context,
             value: (blockhash, fee_calculator),
+        })
+    }
+
+    pub fn get_fee_calculator_for_blockhash(
+        &self,
+        blockhash: &Hash,
+    ) -> io::Result<Option<FeeCalculator>> {
+        let response = self
+            .client
+            .send(
+                &RpcRequest::GetFeeCalculatorForBlockhash,
+                json!([blockhash.to_string()]),
+                0,
+            )
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("GetFeeCalculatorForBlockhash request failure: {:?}", e),
+                )
+            })?;
+        let Response { value, .. } = serde_json::from_value::<Response<Option<RpcFeeCalculator>>>(
+            response,
+        )
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("GetFeeCalculatorForBlockhash parse failure: {:?}", e),
+            )
+        })?;
+        Ok(value.map(|rf| rf.fee_calculator))
+    }
+
+    pub fn get_fee_rate_governor(&self) -> RpcResponse<FeeRateGovernor> {
+        let response = self
+            .client
+            .send(&RpcRequest::GetFeeRateGovernor, Value::Null, 0)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("GetFeeRateGovernor request failure: {:?}", e),
+                )
+            })?;
+        let Response {
+            context,
+            value: RpcFeeRateGovernor { fee_rate_governor },
+        } = serde_json::from_value::<Response<RpcFeeRateGovernor>>(response).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("GetFeeRateGovernor parse failure: {:?}", e),
+            )
+        })?;
+        Ok(Response {
+            context,
+            value: fee_rate_governor,
         })
     }
 

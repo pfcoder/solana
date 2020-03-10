@@ -5,6 +5,7 @@ use crate::{
     },
     display::println_name_value,
 };
+use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use clap::{value_t, value_t_or_exit, App, Arg, ArgMatches, SubCommand};
 use console::{style, Emoji};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -22,6 +23,7 @@ use solana_sdk::{
     epoch_schedule::Epoch,
     hash::Hash,
     message::Message,
+    native_token::lamports_to_sol,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_instruction,
@@ -59,6 +61,14 @@ impl ClusterQuerySubCommands for App<'_, '_> {
                         .validator(is_pubkey_or_keypair)
                         .required(true)
                         .help("Identity pubkey of the validator"),
+                )
+                .arg(
+                    Arg::with_name("node_json_rpc_url")
+                        .index(2)
+                        .value_name("URL")
+                        .takes_value(true)
+                        .validator(is_url)
+                        .help("JSON RPC URL for validator, which is useful for validators with a private RPC service")
                 ),
         )
         .subcommand(
@@ -106,6 +116,17 @@ impl ClusterQuerySubCommands for App<'_, '_> {
                     .takes_value(false)
                     .help(
                         "Return slot at maximum-lockout commitment level",
+                    ),
+            ),
+        )
+        .subcommand(
+            SubCommand::with_name("total-supply").about("Get total number of SOL")
+            .arg(
+                Arg::with_name("confirmed")
+                    .long("confirmed")
+                    .takes_value(false)
+                    .help(
+                        "Return count at maximum-lockout commitment level",
                     ),
             ),
         )
@@ -170,16 +191,7 @@ impl ClusterQuerySubCommands for App<'_, '_> {
         )
         .subcommand(
             SubCommand::with_name("live-slots")
-                .about("Show information about the current slot progression")
-                .arg(
-                    Arg::with_name("websocket_url")
-                        .short("w")
-                        .long("ws")
-                        .value_name("URL")
-                        .takes_value(true)
-                        .default_value("ws://127.0.0.1:8900")
-                        .help("WebSocket URL for PubSub RPC connection"),
-                ),
+                .about("Show information about the current slot progression"),
         )
         .subcommand(
             SubCommand::with_name("block-production")
@@ -227,6 +239,14 @@ impl ClusterQuerySubCommands for App<'_, '_> {
                 .about("Show summary information about the current validators")
                 .alias("show-validators")
                 .arg(
+                    Arg::with_name("confirmed")
+                        .long("confirmed")
+                        .takes_value(false)
+                        .help(
+                            "Return information at maximum-lockout commitment level",
+                        ),
+                )
+                .arg(
                     Arg::with_name("lamports")
                         .long("lamports")
                         .takes_value(false)
@@ -238,8 +258,12 @@ impl ClusterQuerySubCommands for App<'_, '_> {
 
 pub fn parse_catchup(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
     let node_pubkey = pubkey_of(matches, "node_pubkey").unwrap();
+    let node_json_rpc_url = value_t!(matches, "node_json_rpc_url", String).ok();
     Ok(CliCommandInfo {
-        command: CliCommand::Catchup { node_pubkey },
+        command: CliCommand::Catchup {
+            node_pubkey,
+            node_json_rpc_url,
+        },
         signers: vec![],
     })
 }
@@ -279,14 +303,6 @@ pub fn parse_cluster_ping(
     })
 }
 
-pub fn parse_live_slots(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
-    let url: String = value_t_or_exit!(matches, "websocket_url", String);
-    Ok(CliCommandInfo {
-        command: CliCommand::LiveSlots { url },
-        signers: vec![],
-    })
-}
-
 pub fn parse_get_block_time(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
     let slot = value_t_or_exit!(matches, "slot", u64);
     Ok(CliCommandInfo {
@@ -319,6 +335,18 @@ pub fn parse_get_slot(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliErr
     })
 }
 
+pub fn parse_total_supply(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
+    let commitment_config = if matches.is_present("confirmed") {
+        CommitmentConfig::default()
+    } else {
+        CommitmentConfig::recent()
+    };
+    Ok(CliCommandInfo {
+        command: CliCommand::TotalSupply { commitment_config },
+        signers: vec![],
+    })
+}
+
 pub fn parse_get_transaction_count(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
     let commitment_config = if matches.is_present("confirmed") {
         CommitmentConfig::default()
@@ -346,9 +374,17 @@ pub fn parse_show_stakes(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, Cli
 
 pub fn parse_show_validators(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
     let use_lamports_unit = matches.is_present("lamports");
+    let commitment_config = if matches.is_present("confirmed") {
+        CommitmentConfig::default()
+    } else {
+        CommitmentConfig::recent()
+    };
 
     Ok(CliCommandInfo {
-        command: CliCommand::ShowValidators { use_lamports_unit },
+        command: CliCommand::ShowValidators {
+            use_lamports_unit,
+            commitment_config,
+        },
         signers: vec![],
     })
 }
@@ -362,20 +398,42 @@ fn new_spinner_progress_bar() -> ProgressBar {
     progress_bar
 }
 
-pub fn process_catchup(rpc_client: &RpcClient, node_pubkey: &Pubkey) -> ProcessResult {
+pub fn process_catchup(
+    rpc_client: &RpcClient,
+    node_pubkey: &Pubkey,
+    node_json_rpc_url: &Option<String>,
+) -> ProcessResult {
     let cluster_nodes = rpc_client.get_cluster_nodes()?;
 
-    let rpc_addr = cluster_nodes
-        .iter()
-        .find(|contact_info| contact_info.pubkey == node_pubkey.to_string())
-        .ok_or_else(|| format!("Contact information not found for {}", node_pubkey))?
-        .rpc
-        .ok_or_else(|| format!("RPC service not found for {}", node_pubkey))?;
+    let node_client = if let Some(node_json_rpc_url) = node_json_rpc_url {
+        RpcClient::new(node_json_rpc_url.to_string())
+    } else {
+        RpcClient::new_socket(
+            cluster_nodes
+                .iter()
+                .find(|contact_info| contact_info.pubkey == node_pubkey.to_string())
+                .ok_or_else(|| format!("Contact information not found for {}", node_pubkey))?
+                .rpc
+                .ok_or_else(|| format!("RPC service not found for {}", node_pubkey))?,
+        )
+    };
+
+    let reported_node_pubkey = node_client.get_identity()?;
+    if reported_node_pubkey != *node_pubkey {
+        return Err(format!(
+            "The identity reported by node RPC URL does not match.  Expected: {:?}.  Reported: {:?}",
+            node_pubkey, reported_node_pubkey
+        )
+        .into());
+    }
+
+    if rpc_client.get_identity()? == *node_pubkey {
+        return Err("Both RPC URLs reference the same node, unable to monitor for catchup.  Try a different --url".into());
+    }
 
     let progress_bar = new_spinner_progress_bar();
     progress_bar.set_message("Connecting...");
 
-    let node_client = RpcClient::new_socket(rpc_addr);
     let mut previous_rpc_slot = std::u64::MAX;
     let mut previous_slot_distance = 0;
     let sleep_interval = 5;
@@ -471,7 +529,13 @@ pub fn process_leader_schedule(rpc_client: &RpcClient) -> ProcessResult {
 
 pub fn process_get_block_time(rpc_client: &RpcClient, slot: Slot) -> ProcessResult {
     let timestamp = rpc_client.get_block_time(slot)?;
-    Ok(timestamp.to_string())
+    let result = format!(
+        "{} (UnixTimestamp: {})",
+        DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(timestamp, 0), Utc)
+            .to_rfc3339_opts(SecondsFormat::Secs, true),
+        timestamp
+    );
+    Ok(result)
 }
 
 fn slot_to_human_time(slot: Slot) -> String {
@@ -483,7 +547,7 @@ fn slot_to_human_time(slot: Slot) -> String {
 
 pub fn process_get_epoch_info(
     rpc_client: &RpcClient,
-    commitment_config: &CommitmentConfig,
+    commitment_config: CommitmentConfig,
 ) -> ProcessResult {
     let epoch_info = rpc_client.get_epoch_info_with_commitment(commitment_config.clone())?;
     println!();
@@ -529,7 +593,7 @@ pub fn process_get_genesis_hash(rpc_client: &RpcClient) -> ProcessResult {
 
 pub fn process_get_slot(
     rpc_client: &RpcClient,
-    commitment_config: &CommitmentConfig,
+    commitment_config: CommitmentConfig,
 ) -> ProcessResult {
     let slot = rpc_client.get_slot_with_commitment(commitment_config.clone())?;
     Ok(slot.to_string())
@@ -716,9 +780,17 @@ pub fn process_show_block_production(
     Ok("".to_string())
 }
 
+pub fn process_total_supply(
+    rpc_client: &RpcClient,
+    commitment_config: CommitmentConfig,
+) -> ProcessResult {
+    let total_supply = rpc_client.total_supply_with_commitment(commitment_config.clone())?;
+    Ok(format!("{} SOL", lamports_to_sol(total_supply)))
+}
+
 pub fn process_get_transaction_count(
     rpc_client: &RpcClient,
-    commitment_config: &CommitmentConfig,
+    commitment_config: CommitmentConfig,
 ) -> ProcessResult {
     let transaction_count =
         rpc_client.get_transaction_count_with_commitment(commitment_config.clone())?;
@@ -732,7 +804,7 @@ pub fn process_ping(
     interval: &Duration,
     count: &Option<u64>,
     timeout: &Duration,
-    commitment_config: &CommitmentConfig,
+    commitment_config: CommitmentConfig,
 ) -> ProcessResult {
     let to = Keypair::new().pubkey();
 
@@ -873,6 +945,9 @@ pub fn process_live_slots(url: &str) -> ProcessResult {
     let (mut client, receiver) = PubsubClient::slot_subscribe(url)?;
     slot_progress.set_message("Connected.");
 
+    let spacer = "|";
+    slot_progress.println(spacer);
+
     let mut last_root = std::u64::MAX;
     let mut last_root_update = Instant::now();
     let mut slots_per_second = std::f64::NAN;
@@ -918,11 +993,19 @@ pub fn process_live_slots(url: &str) -> ProcessResult {
                     //
                     if slot_delta != root_delta {
                         let prev_root = format!(
-                            "|<- {} <- … <- {} <- {}",
+                            "|<--- {} <- … <- {} <- {}   (prev)",
                             previous.root, previous.parent, previous.slot
-                        )
-                        .to_owned();
+                        );
                         slot_progress.println(&prev_root);
+
+                        let new_root = format!(
+                            "|  '- {} <- … <- {} <- {}   (next)",
+                            new_info.root, new_info.parent, new_info.slot
+                        );
+
+                        slot_progress.println(prev_root);
+                        slot_progress.println(new_root);
+                        slot_progress.println(spacer);
                     }
                 }
                 current = Some(new_info);
@@ -1012,9 +1095,13 @@ pub fn process_show_stakes(
     Ok("".to_string())
 }
 
-pub fn process_show_validators(rpc_client: &RpcClient, use_lamports_unit: bool) -> ProcessResult {
-    let epoch_info = rpc_client.get_epoch_info()?;
-    let vote_accounts = rpc_client.get_vote_accounts()?;
+pub fn process_show_validators(
+    rpc_client: &RpcClient,
+    use_lamports_unit: bool,
+    commitment_config: CommitmentConfig,
+) -> ProcessResult {
+    let epoch_info = rpc_client.get_epoch_info_with_commitment(commitment_config)?;
+    let vote_accounts = rpc_client.get_vote_accounts_with_commitment(commitment_config)?;
     let total_active_stake = vote_accounts
         .current
         .iter()
@@ -1219,6 +1306,19 @@ mod tests {
             parse_command(&test_get_slot, &default_keypair_file, None).unwrap(),
             CliCommandInfo {
                 command: CliCommand::GetSlot {
+                    commitment_config: CommitmentConfig::recent(),
+                },
+                signers: vec![],
+            }
+        );
+
+        let test_total_supply = test_commands
+            .clone()
+            .get_matches_from(vec!["test", "total-supply"]);
+        assert_eq!(
+            parse_command(&test_total_supply, &default_keypair_file, None).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::TotalSupply {
                     commitment_config: CommitmentConfig::recent(),
                 },
                 signers: vec![],
